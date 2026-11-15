@@ -21,8 +21,27 @@ _omatuner_runner() {
   fi
 }
 
+_omatuner_nologin() {
+  # The path of nologin is not fixed across distributions (Arch puts it in
+  # /usr/bin, Debian in /usr/sbin); a hardcoded one makes useradd fail with
+  # "invalid shell". Prefer a real login-denying shell, fall back to /bin/false.
+  local candidate
+  for candidate in /usr/sbin/nologin /usr/bin/nologin /sbin/nologin; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  if candidate="$(command -v nologin 2>/dev/null)" && [[ -n "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  printf '%s' /bin/false
+}
+
 ensure_service_user() {
-  local user="${1:-omatuner}" home="${2:-/var/lib/omatuner}"
+  local user="${1:-omatuner}" home="${2:-/var/lib/omatuner}" shell
+  shell="$(_omatuner_nologin)"
 
   if getent passwd "$user" >/dev/null 2>&1; then
     echo "user $user already exists"
@@ -35,12 +54,12 @@ ensure_service_user() {
     # the socket permission is granted to. --gid keeps the leftover gid.
     echo "group $user exists without its user (left by a previous uninstall); reusing it"
     _omatuner_runner useradd --system --gid "$user" --home-dir "$home" \
-      --create-home --shell /usr/sbin/nologin "$user"
+      --create-home --shell "$shell" "$user"
     return 0
   fi
 
   _omatuner_runner useradd --system --user-group --home-dir "$home" \
-    --create-home --shell /usr/sbin/nologin "$user"
+    --create-home --shell "$shell" "$user"
 }
 
 remove_service_user() {

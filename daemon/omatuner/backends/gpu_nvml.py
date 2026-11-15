@@ -32,7 +32,7 @@ from ..nvml_defs import (
     NVML_TEMP_SLOWDOWN,
 )
 from .base import Backend, BackendError, Control, Curve, CurvePoint
-from .nvapi import NvApi, NvApiError, detect_curve_scale
+from .nvapi import NvApi, NvApiError, curve_scale_for_writes
 
 # Seconds between helper re-probes while a write verdict is still negative.
 # The helper starts independently of the daemon (no unit ordering), so the
@@ -79,6 +79,7 @@ class Nvml:
             nvml_defs.proto(self.lib, name, argtypes, restype)
 
         proto("nvmlDeviceGetName", [ctypes.c_void_p, ctypes.c_char_p, u32])
+        proto("nvmlDeviceGetCount_v2", [u32_p])
         proto("nvmlDeviceGetGpcClkVfOffset", [ctypes.c_void_p, c_int_p])
         proto("nvmlDeviceGetMemClkVfOffset", [ctypes.c_void_p, c_int_p])
         proto("nvmlDeviceSetGpcClkVfOffset", [ctypes.c_void_p, ctypes.c_int])
@@ -110,6 +111,15 @@ class Nvml:
         buf = ctypes.create_string_buffer(80)
         if self.lib.nvmlDeviceGetName(self.device, buf, 80) == NVML_SUCCESS:
             self.name = buf.value.decode("utf-8", "replace")
+        # The curve is addressed through NvAPI's first physical GPU, so it is
+        # only safe on a machine with exactly one GPU. A missing symbol or a
+        # failed call leaves this None ("cannot prove a single GPU"), which
+        # makes the curve unsupported rather than guessed.
+        self.device_count: int | None = None
+        if hasattr(self.lib, "nvmlDeviceGetCount_v2"):
+            count = ctypes.c_uint(0)
+            if self.lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) == NVML_SUCCESS:
+                self.device_count = int(count.value)
 
     def has(self, fn: str) -> bool:
         return hasattr(self.lib, fn)
@@ -135,6 +145,9 @@ class GpuNvmlBackend(Backend):
         self.write_cause = None
         self.curve_cause: str | None = None
         self.curve_writable = False
+        # True only after a successful curve read during probe(); the
+        # single-GPU guard and a failed read both leave it False.
+        self.curve_supported = False
         # Raw-to-real divisor for the V/F frequencies, detected once per probe
         # against NVML's SM max clock (driver 580 reports them at 2x).
         self.curve_scale: float = 1.0
@@ -216,8 +229,9 @@ class GpuNvmlBackend(Backend):
         # One no-op write per offset control answers whether this process may
         # change clocks at all: rewrite the value that is already applied.
         # Observed on the reference machine (GTX 1060, driver 580): an
-        # unprivileged caller gets NO_PERMISSION (4); NOT_SUPPORTED (3) is
-        # also reported as needing the elevated service.
+        # unprivileged caller gets NO_PERMISSION (4). NOT_SUPPORTED (3) means
+        # the GPU or driver has no clock offsets at all, which no service can
+        # change.
         if not (self.nvml.has("nvmlDeviceGetGpcClkVfOffset")
                 and self.nvml.has("nvmlDeviceSetGpcClkVfOffset")):
             self.write_cause = "this driver does not expose core clock offsets"
@@ -225,11 +239,13 @@ class GpuNvmlBackend(Backend):
             try:
                 current = self._get_offset("nvmlDeviceGetGpcClkVfOffset")
                 rc = self.nvml.lib.nvmlDeviceSetGpcClkVfOffset(self.nvml.device, ctypes.c_int(current))
-                if rc in (NVML_ERROR_NO_PERMISSION, NVML_ERROR_NOT_SUPPORTED):
+                if rc == NVML_ERROR_NO_PERMISSION:
                     self.write_cause = (
                         "the NVIDIA driver refuses clock changes from this process "
                         "(requires the OmaTuner system service; install with bin/install)"
                     )
+                elif rc == NVML_ERROR_NOT_SUPPORTED:
+                    self.write_cause = "this GPU or driver does not support clock offsets"
                 elif rc != NVML_SUCCESS:
                     self.write_cause = f"driver refused clock control (NVML error {rc})"
                 elif self._get_offset("nvmlDeviceGetGpcClkVfOffset") != current:
@@ -276,16 +292,25 @@ class GpuNvmlBackend(Backend):
             if speed is None:
                 self.fan_write_cause = "the driver did not report the current fan speed"
                 return
-            rc = self.nvml.lib.nvmlDeviceSetFanSpeed_v2(self.nvml.device, 0, speed)
-            if rc != NVML_SUCCESS:
-                self.fan_write_cause = f"the driver rejected a fan write (NVML error {rc})"
-                return
-            rc = nvml_defs.set_fan_auto(self.nvml.lib, self.nvml.device, 0)
-            if rc != NVML_SUCCESS:
+            # The hand-back is unconditional: once the setter has been
+            # called, the fan must be returned to the driver even when the
+            # write or the confirmation raises in between.
+            failure: str | None = None
+            try:
+                rc = self.nvml.lib.nvmlDeviceSetFanSpeed_v2(self.nvml.device, 0, speed)
+                if rc != NVML_SUCCESS:
+                    failure = f"the driver rejected a fan write (NVML error {rc})"
+            except Exception as exc:
+                failure = f"the fan write probe raised: {exc}"
+            finally:
+                handback = self._hand_fan_back()
+            if handback is not None:
                 self.fan_write_cause = (
-                    "the driver did not return the fan to automatic control "
-                    f"(NVML error {rc})"
+                    f"{failure}; {handback}" if failure else handback
                 )
+                return
+            if failure is not None:
+                self.fan_write_cause = failure
                 return
             self.fan_writable = True
             self.fan_direct = True
@@ -294,6 +319,30 @@ class GpuNvmlBackend(Backend):
         ok, cause = self.helper.available()
         self.fan_writable = ok
         self.fan_write_cause = None if ok else cause
+
+    def _hand_fan_back(self) -> str | None:
+        """Return fan 0 to driver control, retrying once. Cause text or None.
+
+        The retry is one more automatic-control call, never another speed
+        write. A failure here leaves the fan possibly pinned at the probe
+        duty, so the cause says how to clear it.
+        """
+        rc = nvml_defs.NVML_NO_AUTO_CONTROL
+        for attempt in range(2):
+            try:
+                rc = nvml_defs.set_fan_auto(self.nvml.lib, self.nvml.device, 0)
+            except Exception as exc:
+                rc = f"{exc}"
+            if rc == NVML_SUCCESS:
+                return None
+            if attempt == 0:
+                continue
+        detail = f"NVML error {rc}" if isinstance(rc, int) else str(rc)
+        return (
+            "the driver did not return the fan to automatic control "
+            f"({detail}); the fan may be left at a fixed duty until the driver "
+            "is reloaded or the machine reboots"
+        )
 
     def _read_fan_caps(self) -> None:
         self.fan_supported = False
@@ -410,12 +459,16 @@ class GpuNvmlBackend(Backend):
             raise BackendError(self.fan_write_cause, cause="driver")
         for fan in range(self.fan_count):
             rc = self.nvml.lib.nvmlDeviceSetFanSpeed_v2(self.nvml.device, fan, speed)
-            if rc in (NVML_ERROR_NO_PERMISSION, NVML_ERROR_NOT_SUPPORTED):
+            if rc == NVML_ERROR_NO_PERMISSION:
                 self.fan_write_cause = (
                     "the NVIDIA driver refuses fan changes from this process "
                     "(requires the OmaTuner system service; install with bin/install)"
                 )
                 raise BackendError(self.fan_write_cause, cause="driver")
+            if rc == NVML_ERROR_NOT_SUPPORTED:
+                raise BackendError(
+                    "this GPU or driver does not support fan control", cause="driver"
+                )
             if rc != NVML_SUCCESS:
                 raise BackendError(
                     f"fan speed rejected by driver (NVML error {rc})", cause="driver"
@@ -444,12 +497,17 @@ class GpuNvmlBackend(Backend):
                 raise BackendError(
                     "this driver cannot return the fan to automatic control", cause="driver"
                 )
-            if rc in (NVML_ERROR_NO_PERMISSION, NVML_ERROR_NOT_SUPPORTED):
+            if rc == NVML_ERROR_NO_PERMISSION:
                 self.fan_write_cause = (
                     "the NVIDIA driver refuses fan changes from this process "
                     "(requires the OmaTuner system service; install with bin/install)"
                 )
                 raise BackendError(self.fan_write_cause, cause="driver")
+            if rc == NVML_ERROR_NOT_SUPPORTED:
+                raise BackendError(
+                    "this GPU or driver does not support automatic fan control",
+                    cause="driver",
+                )
             if rc != NVML_SUCCESS:
                 raise BackendError(
                     f"the driver refused automatic fan control (NVML error {rc})",
@@ -586,8 +644,36 @@ class GpuNvmlBackend(Backend):
 
     def _probe_curve(self) -> None:
         self.curve_writable = False
+        self.curve_supported = False
+        # Offsets, fan and telemetry address NVML device 0; the curve
+        # addresses NvAPI's first physical GPU. The two enumerations are not
+        # guaranteed to agree, so a machine with more than one GPU cannot
+        # prove the curve belongs to the tuned card. The count comes from the
+        # real Nvml wrapper; an injected test double carries none and stands
+        # for one card. None means the driver could not report a count, which
+        # is not proof of a single GPU either.
+        count = getattr(self.nvml, "device_count", 1)
+        if count is None:
+            self.curve_cause = (
+                "the NVIDIA driver did not report how many GPUs are present; "
+                "the V/F curve cannot be matched to the tuned GPU (GPU 0)"
+            )
+            return
+        if count != 1:
+            self.curve_cause = (
+                "more than one NVIDIA GPU is present; the V/F curve cannot be "
+                "matched to the tuned GPU (GPU 0)"
+            )
+            return
         self._ensure_nvapi()
         if self.nvapi is None:
+            return
+        api_count = getattr(self.nvapi, "physical_gpu_count", None)
+        if api_count is not None and api_count != 1:
+            self.curve_cause = (
+                "more than one NVIDIA GPU is present; the V/F curve cannot be "
+                "matched to the tuned GPU (GPU 0)"
+            )
             return
         # Read raw first: the stock maximum is what NVML's max SM clock can be
         # compared against even when the user has already moved points.
@@ -597,11 +683,17 @@ class GpuNvmlBackend(Backend):
         except NvApiError as exc:
             self.curve_cause = f"per-point V/F curve read failed: {exc}"
             return
+        self.curve_supported = True
         stock_max = max(
             (p.base_frequency_mhz or p.frequency_mhz for p in reading.points),
             default=0.0,
         )
-        scale, scale_cause = detect_curve_scale(stock_max, float(self.max_sm_clock))
+        # Without a max SM clock there is nothing to compare the raw curve
+        # against, so the scale would be a guess. The curve stays readable;
+        # curve_scale_for_writes() refuses the write.
+        scale, scale_cause = curve_scale_for_writes(
+            stock_max, float(self.max_sm_clock)
+        )
         if scale is None:
             self.curve_scale = 1.0
             self.curve_writable = False
@@ -661,6 +753,7 @@ class GpuNvmlBackend(Backend):
         self._nvapi_tried = False
         self.curve_cause = None
         self.curve_writable = False
+        self.curve_supported = False
         self.curve_scale = 1.0
         self.temp_write_cause = None
         self.temp_writable = False
@@ -739,6 +832,11 @@ class GpuNvmlBackend(Backend):
             risk_ref_label="max boost clock",
             risk_direction="up",
         )
+        # nvmlDeviceSetMemClkVfOffset takes the value in transfer-rate
+        # (effective) MHz, the same convention as nvidia-settings' memory
+        # transfer rate offset. Measured on the reference GTX 1060: a +50
+        # offset moved `nvidia-smi --query-gpu=clocks.max.memory` by +25 MHz.
+        # The value, range and unit below are passed through unchanged.
         memory = Control(
             key="memory",
             label="Memory clock",
@@ -761,6 +859,12 @@ class GpuNvmlBackend(Backend):
             else None
         )
         temp_range = intersect(range_for("gpu", "temp", self.tuning_mode), driver_temp)
+        # The documented factory value is only a fallback: when the driver
+        # reports its target window, a value outside it would be refused by
+        # the setter, so the reset value follows the window.
+        factory_temp = GPU_TEMP_FACTORY_C
+        if driver_temp is not None:
+            factory_temp = max(driver_temp[0], min(driver_temp[1], GPU_TEMP_FACTORY_C))
         # The temperature target has its own write probe; the clock verdict
         # says nothing about it (the driver gates them differently).
         temp_available = (
@@ -772,7 +876,7 @@ class GpuNvmlBackend(Backend):
             unit="°C",
             minimum=temp_range[0],
             maximum=temp_range[1],
-            factory=GPU_TEMP_FACTORY_C,
+            factory=factory_temp,
             available=temp_available,
             cause=None if temp_available else (
                 self.temp_write_cause or temp_cause or self.probe_failed
@@ -887,6 +991,12 @@ class GpuNvmlBackend(Backend):
 
     def curve(self) -> Curve | None:
         if self.nvapi is None:
+            return Curve(
+                supported=False,
+                writable=False,
+                cause=self.curve_cause or "per-point V/F curve unavailable",
+            )
+        if not self.curve_supported:
             return Curve(
                 supported=False,
                 writable=False,

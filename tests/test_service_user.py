@@ -17,12 +17,22 @@ Run from the project root: python3 -m unittest tests.test_service_user -v
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.abspath(os.path.join(HERE, "..", "bin", "lib-service-user.sh"))
+
+
+def nologin_shell() -> str:
+    """The shell the library resolves, in the same order."""
+    for candidate in ("/usr/sbin/nologin", "/usr/bin/nologin", "/sbin/nologin"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("nologin") or "/bin/false"
+
 
 GETENT = """#!/usr/bin/env bash
 case "$1" in
@@ -81,7 +91,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls_made(), [
             "useradd --system --user-group --home-dir /var/lib/omatuner "
-            "--create-home --shell /usr/sbin/nologin omatuner",
+            f"--create-home --shell {nologin_shell()} omatuner",
         ])
 
     def test_orphan_group_is_reused_instead_of_failing(self):
@@ -90,7 +100,7 @@ class AccountTests(unittest.TestCase):
         self.assertIn("reusing it", result.stdout)
         self.assertEqual(self.calls_made(), [
             "useradd --system --gid omatuner --home-dir /var/lib/omatuner "
-            "--create-home --shell /usr/sbin/nologin omatuner",
+            f"--create-home --shell {nologin_shell()} omatuner",
         ])
 
     def test_existing_user_is_untouched(self):

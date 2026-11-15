@@ -3,7 +3,9 @@
 The only writes here are the backend's own value-preserving write probes: it
 rewrites the currently applied clock offsets and fan duty and restores what it
 touched. Everything else proves the read paths (NVML queries, /proc parsing,
-hwmon discovery) and that the permission probes report the real causes.
+hwmon discovery) and that the permission probes report the real causes. The
+class skips as root, before any probe runs, and on a machine that is not the
+reference GTX 1060.
 Run from the project root: python3 -m unittest tests.test_realhw -v
 """
 
@@ -15,43 +17,45 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "daemon"))
 
+from omatuner.backends.base import BackendError
 from omatuner.backends.cpu_msr import CpuMsrBackend, decode_offset, encode_offset
-from omatuner.backends.gpu_nvml import GpuNvmlBackend
+from omatuner.backends.gpu_nvml import GpuNvmlBackend, Nvml
 from omatuner.backends.telemetry import SystemTelemetry
 
 
 class RealHardwareTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # As root the value-preserving write probes below would really write
+        # on whatever card this machine has. Skip before touching anything.
+        if os.geteuid() == 0:
+            raise unittest.SkipTest(
+                "real-hardware tests are read-only and must not run as root"
+            )
+        # The card's identity decides the run before probe(): probe() runs the
+        # write probes, which must not reach a machine these assertions were
+        # not written for. Constructing Nvml only inits NVML and reads the
+        # name, and probe() reuses it.
         cls.gpu = GpuNvmlBackend()
+        try:
+            cls.gpu.nvml = Nvml()
+        except BackendError as exc:
+            raise unittest.SkipTest(f"no NVIDIA device ({exc})")
+        if "1060" not in cls.gpu.nvml.name:
+            raise unittest.SkipTest(
+                f"reference tests expect a GTX 1060, found {cls.gpu.nvml.name!r}"
+            )
         cls.gpu.probe()
         cls.cpu = CpuMsrBackend({"intel": True, "name": "test"})
         cls.cpu.probe()
 
-    def require_reference_gpu(self) -> None:
-        """Skip on a machine that is not the reference GPU.
-
-        These assertions pin a GTX 1060 on driver 580. Another card, or no
-        card at all, would fail them for reasons that say nothing about the
-        code, so a public checkout reports a skip instead. `bin/validate`
-        runs them on the reference machine.
-        """
-        if not self.gpu.present:
-            self.skipTest(f"no NVIDIA device ({self.gpu.cause})")
-        if "1060" not in (self.gpu.device_name or ""):
-            self.skipTest(
-                f"reference tests expect a GTX 1060, found {self.gpu.device_name!r}"
-            )
-
     def test_gpu_offsets_readable(self):
-        self.require_reference_gpu()
         values = self.gpu.read()
         self.assertIn("core", values)
         self.assertIn("memory", values)
         self.assertIsInstance(values["core"], int)
 
     def test_gpu_curve_is_read_from_the_driver(self):
-        self.require_reference_gpu()
         # Pascal on driver 580 has no NVML V/F point API, but the driver's
         # libnvidia-api exposes the same 128-point table LACT uses. Reading
         # it is safe; writing is left to the privileged service.
@@ -66,7 +70,6 @@ class RealHardwareTests(unittest.TestCase):
             self.assertTrue(curve.cause)
 
     def test_gpu_fan_reads_live_and_gates_writes_on_root(self):
-        self.require_reference_gpu()
         # Driver 580 accepts fan changes from uid 0 or through the root
         # helper, so a non-root process can be writable. The invariant is
         # narrower: a read-only fan must say why.
@@ -79,7 +82,6 @@ class RealHardwareTests(unittest.TestCase):
             self.assertTrue(info["cause"], "a read-only fan needs its cause")
 
     def test_temperature_thresholds_are_real(self):
-        self.require_reference_gpu()
         self.assertTrue(self.gpu.temp_supported)
         self.assertEqual(self.gpu.temp_api, "threshold")
         self.assertGreaterEqual(self.gpu.temp_min_c, 40)
@@ -100,7 +102,6 @@ class RealHardwareTests(unittest.TestCase):
             self.assertTrue(controls["temp"].cause)
 
     def test_gpu_write_permission_probed_honestly(self):
-        self.require_reference_gpu()
         # Without the system service this process cannot change clocks; the
         # probe must say so instead of pretending. On driver 580 + Pascal the
         # unprivileged refusal arrives as NO_PERMISSION (4), so either wording
@@ -144,7 +145,6 @@ class RealHardwareTests(unittest.TestCase):
         self.assertEqual(hex(encode_offset(-125.0)), "0xf0000000")
 
     def test_gpu_telemetry(self):
-        self.require_reference_gpu()
         data = self.gpu.telemetry()
         self.assertIn("gpuUsage", data)
         self.assertIn("gpuTemp", data)

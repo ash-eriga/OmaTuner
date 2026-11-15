@@ -13,10 +13,12 @@ boot and resume.
 
 from __future__ import annotations
 
+import errno
 import os
 import pwd
 import struct
-from typing import Any
+import subprocess
+from typing import Any, Callable
 
 from .base import Backend, BackendError, Control
 
@@ -27,6 +29,21 @@ PLANE_CACHE = 2
 READ_COMMAND = 0x8000001000000000
 WRITE_FLAG = 0x100000000
 DATA_MASK = 0xFFE00000
+
+MSR_PATH = "/dev/cpu/0/msr"
+LOCKDOWN_PATH = "/sys/kernel/security/lockdown"
+CPUINFO_PATH = "/proc/cpuinfo"
+# (marker, kind) pairs for the container detectors that have no file content.
+CONTAINER_MARKERS = (("/.dockerenv", "docker"), ("/run/.containerenv", "container"))
+VIRT_DETECT_TIMEOUT_S = 2
+
+# Reported for both CPU controls after a write the firmware refused. A 10th
+# gen or newer Intel part with the Plundervolt mitigation answers the OC
+# mailbox but never accepts an offset, and CFG lock does the same.
+LOCKED_CAUSE = (
+    "the firmware locks the CPU voltage offset (common on Intel 10th gen and newer, "
+    "or with CFG lock); undervolting is not possible on this machine"
+)
 
 
 def encode_offset(mv: float) -> int:
@@ -46,19 +63,85 @@ def decode_offset(data_dword: int) -> float:
     return signed / 1.024
 
 
+def selected_lockdown_mode(path: str = LOCKDOWN_PATH) -> str | None:
+    """The active kernel lockdown mode when it is integrity or confidentiality.
+
+    `/sys/kernel/security/lockdown` reads like `none [integrity]
+    confidentiality` with the selected mode in brackets. The file is absent
+    when the kernel has no lockdown support.
+    """
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    for mode in ("integrity", "confidentiality"):
+        if f"[{mode}]" in text:
+            return mode
+    return None
+
+
+def detect_virtualization(
+    cpuinfo_path: str = CPUINFO_PATH,
+    markers: tuple[tuple[str, str], ...] = CONTAINER_MARKERS,
+) -> str | None:
+    """A name for the VM or container this process runs in, else None.
+
+    `systemd-detect-virt` is authoritative when installed; the `hypervisor`
+    CPU flag and the container marker files cover images without it. The
+    detector must never fail a probe: an absent or hanging tool falls through.
+    """
+    try:
+        result = subprocess.run(
+            ["systemd-detect-virt"],
+            capture_output=True,
+            text=True,
+            timeout=VIRT_DETECT_TIMEOUT_S,
+            check=False,
+        )
+        kind = (result.stdout or "").strip()
+        if result.returncode == 0 and kind and kind != "none":
+            return kind
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open(cpuinfo_path, "r", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith(("flags", "Features")) and "hypervisor" in line.split():
+                    return "virtual machine"
+    except OSError:
+        pass
+    for marker, kind in markers:
+        if os.path.exists(marker):
+            return kind
+    return None
+
+
 class CpuMsrBackend(Backend):
     component = "cpu"
 
-    def __init__(self, cpu_info: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        cpu_info: dict[str, Any] | None = None,
+        *,
+        msr_path: str = MSR_PATH,
+        lockdown_path: str = LOCKDOWN_PATH,
+        detect_virt: Callable[[], str | None] = detect_virtualization,
+    ):
         self.cpu_info = cpu_info or {}
         self.present = bool(self.cpu_info.get("intel", True))
         self.available = False
         self.cause: str | None = None
         self.fd: int | None = None
         self.device_name = self.cpu_info.get("name", "")
+        # Injected so a test can describe a VM or a locked-down kernel without
+        # reading (or writing) this machine's files.
+        self.msr_path = msr_path
+        self.lockdown_path = lockdown_path
+        self.detect_virt = detect_virt
 
     def _msr_path(self) -> str:
-        return "/dev/cpu/0/msr"
+        return self.msr_path
 
     def _signature(self) -> tuple[int, int, int, int, int] | None:
         """Identity of the device node, or None when absent.
@@ -83,10 +166,17 @@ class CpuMsrBackend(Backend):
         self.device_present = os.path.exists(path)
         self.device_signature = self._signature()
         if not self.device_present:
-            self.cause = (
-                "msr kernel module not loaded; install the OmaTuner system service "
-                "(bin/install) or run `modprobe msr`"
-            )
+            virtualization = self._virtualization()
+            if virtualization:
+                self.cause = (
+                    f"running in a virtual machine or container ({virtualization}); "
+                    "the host must expose MSR access"
+                )
+            else:
+                self.cause = (
+                    "msr kernel module not loaded; install the OmaTuner system service "
+                    "(bin/install) or run `modprobe msr`"
+                )
             return
         try:
             self.fd = os.open(path, os.O_RDWR | os.O_SYNC)
@@ -106,13 +196,46 @@ class CpuMsrBackend(Backend):
         try:
             self._transact(READ_COMMAND | (PLANE_CORE << 40))
         except OSError as exc:
-            self.cause = f"OC mailbox did not respond: {exc.strerror or exc}"
+            self.cause = self._mailbox_failure_cause(exc)
             os.close(self.fd)
             self.fd = None
             return
         self.available = True
         if not self.device_name:
             self.device_name = self._cpu_model()
+
+    def _virtualization(self) -> str | None:
+        try:
+            return self.detect_virt()
+        except Exception:
+            # A broken detector is not a verdict on the hardware.
+            return None
+
+    def _mailbox_failure_cause(self, exc: OSError) -> str:
+        original = f"OC mailbox did not respond: {exc.strerror or exc}"
+        denied = getattr(exc, "errno", None) == errno.EPERM or "Operation not permitted" in str(exc)
+        if not denied:
+            return original
+        mode = selected_lockdown_mode(self.lockdown_path)
+        if mode is None:
+            return original
+        return (
+            f"kernel lockdown ({mode}) blocks MSR writes; "
+            "it is usually enabled by Secure Boot"
+        )
+
+    def _mark_voltage_locked(self) -> None:
+        """Take both controls off the panel after the firmware refused a write.
+
+        The mailbox answers, so probe() cannot tell a locked voltage plane
+        from a writeable one; the first rejected offset is the only evidence.
+        Keeping `available` true would offer the same edit at every apply.
+        The device stays open: the core restores the previous offsets right
+        after this failure, and a closed node would turn that restore into an
+        uncertain state.
+        """
+        self.available = False
+        self.cause = LOCKED_CAUSE
 
     def _owner_name(self) -> str:
         try:
@@ -221,7 +344,14 @@ class CpuMsrBackend(Backend):
         return {"core": int(round(core)), "cache": int(round(cache))}
 
     def apply(self, values: dict[str, int]) -> None:
-        if "core" in values:
-            self._write_plane(PLANE_CORE, float(values["core"]))
-        if "cache" in values:
-            self._write_plane(PLANE_CACHE, float(values["cache"]))
+        try:
+            if "core" in values:
+                self._write_plane(PLANE_CORE, float(values["core"]))
+            if "cache" in values:
+                self._write_plane(PLANE_CACHE, float(values["cache"]))
+        except BackendError as exc:
+            if exc.cause == "firmware":
+                # Keep the failure visible to the caller: the core still
+                # journals it and reports the restore, exactly as before.
+                self._mark_voltage_locked()
+            raise

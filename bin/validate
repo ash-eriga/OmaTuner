@@ -18,10 +18,11 @@ trap 'rm -rf "$logdir"' EXIT
 
 pass=0
 fail=0
+skip=0
 section() { printf '\n== %s\n' "$1"; }
 report() {
   if [[ "$1" == ok ]]; then pass=$((pass+1)); printf '  PASS %s\n' "$2"
-  elif [[ "$1" == skip ]]; then printf '  SKIP %s\n' "$2"
+  elif [[ "$1" == skip ]]; then skip=$((skip+1)); printf '  SKIP %s\n' "$2"
   else fail=$((fail+1)); printf '  FAIL %s\n' "$2"; fi
 }
 
@@ -93,8 +94,14 @@ else
 fi
 
 section "root helper (fan and temperature writes)"
-if systemctl is-active --quiet omatuner-fan.service 2>/dev/null; then
-  report ok "omatuner-fan.service active (fan and temperature writes go through root)"
+# The unit has ConditionPathExists=/dev/nvidiactl; a machine without it
+# cannot run the helper, and a GPU whose fan the driver does not expose has
+# nothing for it to write. Both are skips, not failures. OMATUNER_NVIDIACTL
+# overrides the path so the skip branch can be proven without that machine.
+nvidiactl="${OMATUNER_NVIDIACTL:-/dev/nvidiactl}"
+if [[ ! -e "$nvidiactl" ]]; then
+  report skip "no NVIDIA control device at $nvidiactl: omatuner-fan.service is skipped and fan and temperature writes stay read-only"
+else
   fan_state="$(PYTHONPATH=daemon python3 -m omatuner status --json 2>/dev/null | python3 -c "
 import json, sys
 try:
@@ -103,12 +110,30 @@ except ValueError:
     sys.exit(1)
 print(json.dumps({k: fan.get(k) for k in ('supported', 'writable', 'speed', 'cause')}))
 " 2>/dev/null)"
-  if [[ -n "$fan_state" ]]; then
-    report ok "fan descriptor: $fan_state"
-  else
-    report skip "fan descriptor unavailable (daemon not answering)"
-  fi
-  temp_state="$(PYTHONPATH=daemon python3 -m omatuner status --json 2>/dev/null | python3 -c "
+  fan_supported="$(printf '%s' "$fan_state" | python3 -c "
+import json, sys
+try:
+    print('true' if json.load(sys.stdin).get('supported') is True else 'false')
+except ValueError:
+    print('')
+" 2>/dev/null)"
+  fan_cause="$(printf '%s' "$fan_state" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('cause') or '')
+except ValueError:
+    print('')
+" 2>/dev/null)"
+  if [[ "$fan_supported" == false ]]; then
+    report skip "GPU fan is unsupported on this device${fan_cause:+ ($fan_cause)}; duty and curve stay read-only"
+  elif systemctl is-active --quiet omatuner-fan.service 2>/dev/null; then
+    report ok "omatuner-fan.service active (fan and temperature writes go through root)"
+    if [[ -n "$fan_state" ]]; then
+      report ok "fan descriptor: $fan_state"
+    else
+      report skip "fan descriptor unavailable (daemon not answering)"
+    fi
+    temp_state="$(PYTHONPATH=daemon python3 -m omatuner status --json 2>/dev/null | python3 -c "
 import json, sys
 try:
     controls = (json.load(sys.stdin).get('state') or {}).get('controls', {}).get('gpu') or []
@@ -117,13 +142,14 @@ except ValueError:
 temp = next((c for c in controls if c.get('key') == 'temp'), {})
 print(json.dumps({k: temp.get(k) for k in ('available', 'value', 'cause')}))
 " 2>/dev/null)"
-  if [[ -n "$temp_state" ]]; then
-    report ok "temperature descriptor: $temp_state"
+    if [[ -n "$temp_state" ]]; then
+      report ok "temperature descriptor: $temp_state"
+    else
+      report skip "temperature descriptor unavailable (daemon not answering)"
+    fi
   else
-    report skip "temperature descriptor unavailable (daemon not answering)"
+    report fail "omatuner-fan.service is not active; fan and temperature writes stay read-only (systemctl status omatuner-fan)"
   fi
-else
-  report fail "omatuner-fan.service is not active; fan and temperature writes stay read-only (systemctl status omatuner-fan)"
 fi
 
 section "live plugin in the running shell"
@@ -192,5 +218,5 @@ else
   report skip "not requested (run bin/validate --visual with the session unlocked)"
 fi
 
-printf '\n== summary: %d passed, %d failed\n' "$pass" "$fail"
+printf '\n== summary: %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [[ $fail -eq 0 ]]

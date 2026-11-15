@@ -26,6 +26,14 @@ from .statestore import Journal, now_ms, read_json, remove, write_json
 COMPONENTS = ("cpu", "gpu")
 _MISSING = object()
 
+# Reported next to thermalGuard when a guarded component has no reading. The
+# guard only protects what it can see; presenting an unreadable sensor as
+# armed would tell the user a change is being watched when it is not.
+_THERMAL_SENSOR_CAUSE = {
+    "cpu": "the CPU package temperature sensor is unreadable; the thermal guard cannot watch the CPU",
+    "gpu": "the GPU temperature is unreadable; the thermal guard cannot watch the GPU",
+}
+
 
 def _bool_map(value: Any) -> dict[str, bool] | None:
     """Shape check for paused.json: one boolean per component."""
@@ -253,6 +261,9 @@ class TunerCore:
         # Thermal verification: component -> {previous, until, mode}. Populated
         # at confirm and cleared by a breach or when the window expires.
         self.thermal_guard: dict[str, dict] = {}
+        # The sample the guard last evaluated. A guard is only reported as
+        # armed for a component whose sensor produced a reading here.
+        self.thermal_sample: dict[str, Any] | None = None
         self.thermal_guard_ms = config.THERMAL_GUARD_MS
         self.thermal_cpu_ceiling_c = config.CPU_THERMAL_CEILING_C
         self.thermal_gpu_ceiling_c = config.GPU_THERMAL_CEILING_C
@@ -553,6 +564,89 @@ class TunerCore:
             if control is not None and control.available:
                 out[key] = value
         return out
+
+    def _range_violation(self, control, value: int) -> str | None:
+        """The message for a value outside the active range, or None.
+
+        apply() raises it for a request; the replay paths use it to decide
+        whether a persisted record may still be written in this mode.
+        """
+        if value < control.minimum or value > control.maximum:
+            return (
+                f"{control.key}={value} {control.unit} is outside "
+                f"{control.minimum}..{control.maximum} "
+                f"{control.unit} for {self.tuning_mode} mode"
+                + ("; expert mode (sudo bin/install --expert) unlocks the wider range"
+                   if self.tuning_mode != config.TUNING_MODE_EXPERT else "")
+            )
+        return None
+
+    def _replay_violation(self, component: str, settings: dict[str, Any]) -> str | None:
+        """Why a persisted record cannot be replayed in the active mode.
+
+        A saved record outlives the tuning mode it was saved in: reinstalling
+        without `--expert` switches back to normal, and the boot default (or
+        the last confirmed session) may hold values only expert mode accepts.
+        The replay paths therefore pass the same gate apply() applies to a
+        request. Returns the sentence to journal and show, or None.
+        """
+        backend = self.backends.get(component)
+        if backend is None:
+            return None
+        controls = {c.key: c for c in backend.controls()}
+        for key, value in settings.items():
+            if key in ("points", "fan", "curveScale"):
+                continue
+            control = controls.get(key)
+            if control is None:
+                # Not a control this backend exposes; _writable drops it, so
+                # it cannot reach the hardware.
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return f"{key}={value!r} is not a number"
+            if isinstance(value, float) and not math.isfinite(value):
+                return f"{key}={value!r} is not a number"
+            violation = self._range_violation(control, int(value))
+            if violation is not None:
+                return violation
+        if component == "gpu" and "fan" in settings:
+            gpu = self.backends.get("gpu")
+            if gpu is not None:
+                try:
+                    info = gpu.fan_info()
+                except Exception:
+                    # A transient backend failure is not a verdict on the
+                    # record; the normal replay path reports it where it
+                    # happens.
+                    return None
+                try:
+                    fan.validate(
+                        settings["fan"],
+                        info,
+                        self.tuning_mode == config.TUNING_MODE_EXPERT,
+                    )
+                except (ValueError, TypeError, KeyError) as exc:
+                    return f"fan settings are invalid: {exc}"
+        return None
+
+    def _reject_replay(self, component: str, settings: dict[str, Any], reason: str) -> None:
+        """Keep a saved record the active mode does not allow off the hardware."""
+        self.journal.log(
+            "replay-out-of-range",
+            component=component,
+            values=dict(settings),
+            reason=reason,
+        )
+        self._raise_notice(
+            "apply-failed",
+            component=component,
+            uncertain=False,
+            message=(
+                f"The saved {component.upper()} values exceed the {self.tuning_mode} mode range "
+                f"({reason}) and were not applied; they must be applied again in "
+                f"{self.tuning_mode} mode."
+            ),
+        )
 
     def _curve_for(self, component: str | None):
         backend = self.backends.get(component or "")
@@ -1052,14 +1146,9 @@ class TunerCore:
             ):
                 raise CoreError("bad-value", f"{key} must be a whole number")
             value = int(value)
-            if value < control.minimum or value > control.maximum:
-                raise CoreError(
-                    "bad-value",
-                    f"{key}={value} {control.unit} is outside {control.minimum}..{control.maximum} "
-                    f"{control.unit} for {self.tuning_mode} mode"
-                    + ("; expert mode (sudo bin/install --expert) unlocks the wider range"
-                       if self.tuning_mode != config.TUNING_MODE_EXPERT else ""),
-                )
+            violation = self._range_violation(control, value)
+            if violation is not None:
+                raise CoreError("bad-value", violation)
             if not control.available:
                 # A hand-written request may resend a control this driver
                 # cannot write, at the value the machine already runs. That
@@ -1286,6 +1375,9 @@ class TunerCore:
             "previousDefault": dict(previous_default) if isinstance(previous_default, dict) else None,
             "hadDefault": previous_default is not None,
         }
+        # Start the guard from a fresh reading: a sensor that never reported
+        # must not be presented as watching this component.
+        self._refresh_thermal_sample()
         self.journal.log(
             "apply-confirmed",
             component=trial.component,
@@ -1521,6 +1613,13 @@ class TunerCore:
             if conflict:
                 self.journal.log("default-skipped", component=component, reason="conflict", conflict=conflict["name"])
                 continue
+            # The default may have been saved in a wider mode than the one
+            # this daemon runs in (a reinstall without --expert). Never replay
+            # a value the active mode refuses; the record stays on disk.
+            reason = self._replay_violation(component, default)
+            if reason is not None:
+                self._reject_replay(component, default, reason)
+                continue
             try:
                 if component == "gpu" and "fan" in default:
                     # The controls are written before the fan policy; if the
@@ -1587,12 +1686,19 @@ class TunerCore:
             record = self.last_applied.get(component)
             if not record or not record.get("settings"):
                 continue
+            settings = record["settings"]
+            # last-applied has the same lifetime problem as a boot default:
+            # it can hold expert values after the daemon is reinstalled in
+            # normal mode. Do not write them; apply() would refuse them.
+            reason = self._replay_violation(component, settings)
+            if reason is not None:
+                self._reject_replay(component, settings, reason)
+                continue
             backend = self.backends[component]
             try:
                 current = backend.read()
             except (BackendError, OSError):
                 current = None
-            settings = record["settings"]
             if current is not None:
                 lost = any(
                     key in current and current[key] != value
@@ -1738,6 +1844,7 @@ class TunerCore:
         notice = dict(self.notice) if self.notice else None
         if notice and notice.get("type") == "abrupt-restart" and self.boot_notice_deadline:
             notice["deadlineMs"] = self.boot_notice_deadline
+        thermal_guard, thermal_guard_cause = self._thermal_guard_view()
 
         return {
             "version": config.VERSION,
@@ -1757,10 +1864,8 @@ class TunerCore:
             "notice": notice,
             "conflicts": self.conflicts,
             "abruptPending": self.abrupt_boot_pending,
-            "thermalGuard": {
-                "cpu": "cpu" in self.thermal_guard,
-                "gpu": "gpu" in self.thermal_guard,
-            },
+            "thermalGuard": thermal_guard,
+            "thermalGuardCause": thermal_guard_cause,
             "thermalCeilings": {
                 "cpuC": self.thermal_cpu_ceiling_c,
                 "gpuC": self.thermal_gpu_ceiling_c,
@@ -1814,6 +1919,53 @@ class TunerCore:
             "gpuSlowdownC": gpu_info.get("slowdownC"),
             "gpuShutdownC": gpu_info.get("shutdownC"),
         }
+
+    def _refresh_thermal_sample(self) -> dict[str, Any]:
+        """Sample the guard sensors and report a component that has none."""
+        self.thermal_sample = self._thermal_sample()
+        self._note_missing_thermal_sensors()
+        return self.thermal_sample
+
+    def _note_missing_thermal_sensors(self) -> None:
+        """Journal an unreadable sensor once per guard window.
+
+        The guard cannot fire for a component with no reading, so the journal
+        and the snapshot must say so instead of letting it look armed.
+        """
+        sample = self.thermal_sample
+        if sample is None:
+            return
+        for component, key in (("cpu", "cpuC"), ("gpu", "gpuC")):
+            guard = self.thermal_guard.get(component)
+            if guard is None or guard.get("missingReported"):
+                continue
+            if sample.get(key) is not None:
+                continue
+            guard["missingReported"] = True
+            self.journal.log(
+                "thermal-sensor-missing",
+                component=component,
+                cause=_THERMAL_SENSOR_CAUSE[component],
+            )
+
+    def _thermal_guard_view(self) -> tuple[dict[str, bool], dict[str, str | None]]:
+        """The guard fields for the snapshot: armed only where it can fire."""
+        if self.thermal_guard and self.thermal_sample is None:
+            self._refresh_thermal_sample()
+        sample = self.thermal_sample or {}
+        armed: dict[str, bool] = {}
+        causes: dict[str, str | None] = {}
+        for component, key in (("cpu", "cpuC"), ("gpu", "gpuC")):
+            if component not in self.thermal_guard:
+                armed[component] = False
+                causes[component] = None
+            elif sample.get(key) is None:
+                armed[component] = False
+                causes[component] = _THERMAL_SENSOR_CAUSE[component]
+            else:
+                armed[component] = True
+                causes[component] = None
+        return armed, causes
 
     def _thermal_ceilings(self, sample: dict[str, Any]) -> tuple[int, int]:
         cpu_ceiling = self.thermal_cpu_ceiling_c
@@ -1870,7 +2022,7 @@ class TunerCore:
                 self.thermal_guard.pop(component, None)
         if self.trial is None and not self.thermal_guard:
             return
-        sample = self._thermal_sample()
+        sample = self._refresh_thermal_sample()
         breaches = self._thermal_breaches(sample)
         if not breaches:
             self._arm_thermal_timer()

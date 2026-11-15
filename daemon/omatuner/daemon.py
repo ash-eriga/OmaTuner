@@ -467,9 +467,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         result = ask("apply", {"component": args.component, "settings": settings, "mode": args.mode})
         applied = result.get("applied") if isinstance(result, dict) else None
-        if isinstance(applied, dict) and isinstance(applied.get("curve"), list):
+        if isinstance(applied, dict) and isinstance(applied.get("points"), list):
             # 80 V/F points would bury the three values the reader wants.
-            shown = dict(applied, curve=f"{len(applied['curve'])} points")
+            shown = dict(applied, points=f"{len(applied['points'])} points")
             result = dict(result, applied=shown)
         print(json.dumps(result, indent=2))
         if args.mode == "reset":

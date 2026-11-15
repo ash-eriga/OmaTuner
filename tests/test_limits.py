@@ -355,7 +355,13 @@ class GpuCurveTests(unittest.TestCase):
             pass
 
         lib = Lib()
-        lib.nvmlDeviceGetMaxClockInfo = lambda device, kind, out: 0
+        def max_clock(device, kind, out):
+            # The fake curve tops out at 1200 MHz; a matching SM maximum
+            # proves scale 1.0, so the curve is writable.
+            out._obj.value = 1200
+            return 0
+
+        lib.nvmlDeviceGetMaxClockInfo = max_clock
         lib.nvmlDeviceGetGpcClkVfOffset = lambda device, out: 0
         lib.nvmlDeviceSetGpcClkVfOffset = lambda device, value: 0
         lib.nvmlDeviceGetMemClkVfOffset = lambda device, out: 0

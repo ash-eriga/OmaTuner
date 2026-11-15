@@ -58,7 +58,8 @@ def detect_curve_scale(curve_max_mhz: float, max_clock_mhz: float) -> tuple[floa
     ``(scale, None)`` when the ratio matches a known scale, ``(1.0, None)``
     when there is nothing to compare against (no NVML clock, which some
     drivers do not expose), and ``(None, cause)`` when the ratio matches
-    neither window.
+    neither window. The ``(1.0, None)`` fallback is not a proven scale:
+    the caller must keep the curve read-only in that case.
     """
     try:
         curve_max = float(curve_max_mhz)
@@ -76,6 +77,32 @@ def detect_curve_scale(curve_max_mhz: float, max_clock_mhz: float) -> tuple[floa
         f"reports a {clock_max:.0f} MHz SM clock (ratio {ratio:.2f}); the "
         "frequency scale is unknown, so per-point writes are refused"
     )
+
+
+UNKNOWN_CLOCK_CAUSE = (
+    "the driver did not report the GPU clock range, so the curve scale is "
+    "unknown; the curve is read-only"
+)
+
+
+def curve_scale_for_writes(
+    curve_max_mhz: float, max_clock_mhz: float
+) -> tuple[float | None, str | None]:
+    """Scale for a write, refusing the unknown-clock fallback.
+
+    `detect_curve_scale` answers (1.0, None) when there is no clock to
+    compare against, which is harmless for a reader showing raw frequencies.
+    A writer cannot use it: the raw-to-real factor may be 2, so an unknown
+    clock becomes (None, cause) and the curve stays read-only.
+    """
+    try:
+        curve_max = float(curve_max_mhz)
+        clock_max = float(max_clock_mhz)
+    except (TypeError, ValueError):
+        return None, UNKNOWN_CLOCK_CAUSE
+    if curve_max <= 0 or clock_max <= 0:
+        return None, UNKNOWN_CLOCK_CAUSE
+    return detect_curve_scale(curve_max, clock_max)
 
 
 class NvApiError(Exception):
@@ -202,6 +229,11 @@ class NvApi:
         self.lib = None
         self.handle = None
         self._fns: dict[int, object] = {}
+        # How many physical GPUs NvAPI enumerated. The backend also reads the
+        # NVML count; the curve is only addressed at one card when both say 1.
+        # None means this instance has not enumerated (an injected test
+        # double), not that the count is unknown.
+        self.physical_gpu_count: int | None = None
         # Raw driver frequency is `scale * real MHz`. The backend sets this
         # after comparing the curve maximum with NVML's SM max clock.
         self.scale: float = 1.0
@@ -237,6 +269,7 @@ class NvApi:
         if count.value < 1 or not handles[0]:
             raise NvApiError("NvAPI reported no physical GPU")
         self.handle = handles[0]
+        self.physical_gpu_count = int(count.value)
 
     def close(self) -> None:
         if self.lib is not None:
@@ -247,6 +280,7 @@ class NvApi:
                 pass
         self.handle = None
         self.lib = None
+        self.physical_gpu_count = None
         self._fns.clear()
 
     def _query(self, ident: int):

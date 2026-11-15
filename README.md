@@ -59,7 +59,7 @@ A later plain install removes it and returns to normal mode.
 
 The system install creates:
 
-- the `omatuner` system user with home `/var/lib/omatuner` and shell `/usr/sbin/nologin`;
+- the `omatuner` system user with home `/var/lib/omatuner` and a nologin shell;
 - `/usr/local/lib/omatuner` with the daemon and `/usr/local/bin/omatuner` as the CLI;
 - `omatuner.service`, running as `omatuner` with only `CAP_SYS_ADMIN` and `CAP_SYS_RAWIO`;
 - `omatuner-fan.service`, the root helper for fan and temperature-target writes;
@@ -271,11 +271,18 @@ The `msr` nodes belong to the `omatuner` user in mode 0600, not to the group; wr
 ## Known limitations
 
 - The GPU power limit is read-only; OmaTuner reports it but does not change it.
+- Memory clock offsets are in transfer-rate MHz, the nvidia-settings convention: on a GTX 1060, +50 raises the memory clock that nvidia-smi reports by 25 MHz.
 - The NVIDIA driver requires root for fan control and the temperature target, which is why those writes go through a root helper. Clock offsets go through the unprivileged daemon.
 - The V/F curve uses undocumented NvAPI functions from `libnvidia-api.so`. If a driver changes the call IDs or structures, the curve reports unavailable with a cause. When the driver refuses `SetControl`, the curve remains readable but read-only.
+- The V/F curve is verified only on Pascal (GTX 10 series). Newer cards use the same NvAPI calls but are untested; if the driver answers with an unexpected layout or scale, the curve is read-only or unavailable with a cause.
+- With more than one NVIDIA GPU, OmaTuner tunes the first NVML device only, and the V/F curve is unavailable.
+- On cards with more than one fan, the RPM readout is fan 0; duty and curve apply to every fan.
+- On Optimus/PRIME laptops the daemon keeps NVML open, which can stop the dGPU from powering down. Untested.
+- Intel 10th generation and newer often lock the voltage offset in firmware (Plundervolt mitigation or CFG lock). OmaTuner reports the lock after the first refused apply and disables the CPU controls.
+- Kernel lockdown, usually enabled by Secure Boot, blocks MSR writes even as root.
 - The 30-second thermal guard lives in the daemon's memory. Restarting the daemon immediately after a confirm loses that remaining window.
 - Only `/dev/cpu/0/msr` is written. On a dual-socket machine the second CPU package keeps its stock voltage.
-- The factory temperature target is the constant 83 °C, not a per-card read; the driver exposes no query for the original acoustic target.
+- The factory temperature target is the constant 83 °C, not a per-card read, and it is clamped to the driver's window; the driver exposes no query for the original acoustic target.
 - The aggressive-zone mark is a fixed 10% beyond the factory reference and is informational only. It does not block a value.
 
 ## Development
