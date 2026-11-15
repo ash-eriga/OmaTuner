@@ -275,6 +275,11 @@ class FanHelper:
         # auto over another tool's manual setting would be rude.
         self.owned = False
         self.owner: object | None = None
+        # The daemon repeats the same duty every few seconds in curve mode.
+        # Logging every write filled the journal, so only a change is logged;
+        # None after a hand-back means the next manual write is logged again.
+        self._last_logged_duty: int | None = None
+        self._last_logged_temperature: int | None = None
         self.lock = threading.Lock()
         self.threads: list[threading.Thread] = []
         self.server: socket.socket | None = None
@@ -492,7 +497,9 @@ class FanHelper:
                 # blocks every later client until the helper restarts.
                 self.owned = True
                 duty = self.device.set_duty(params.get("percent"))
-            self.log(f"set-duty {duty}%")
+            if duty != self._last_logged_duty:
+                self.log(f"set-duty {duty}%")
+                self._last_logged_duty = duty
             return {"applied": duty}
         if method == "auto":
             with self.lock:
@@ -501,12 +508,15 @@ class FanHelper:
                 self.device.set_auto()
                 self.owner = None
                 self.owned = False
+                self._last_logged_duty = None
             self.log("auto")
             return {"auto": True}
         if method == "set-temp":
             with self.lock:
                 target = self.device.set_temperature(params.get("celsius"))
-            self.log(f"set-temp {target} °C")
+            if target != self._last_logged_temperature:
+                self.log(f"set-temp {target} °C")
+                self._last_logged_temperature = target
             return {"applied": target}
         raise FanDeviceError(f"unknown method {method!r}")
 
@@ -535,6 +545,7 @@ class FanHelper:
             self.log("restored the driver fan curve")
             self.owned = False
             self.owner = None
+            self._last_logged_duty = None
             return True
 
     def stop(self) -> None:

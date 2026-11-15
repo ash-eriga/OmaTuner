@@ -525,6 +525,40 @@ class RestoreFailureTests(unittest.TestCase):
         self.assertEqual(device.calls, [("duty", 55), ("auto",)])
 
 
+class LogQuietingTests(unittest.TestCase):
+    """Curve mode rewrites the same duty every few seconds; one line is enough."""
+
+    def helper(self):
+        device = FakeDevice()
+        messages: list[str] = []
+        helper = fanhelper.FanHelper(device, path="/nonexistent/fan.sock", log=messages.append,
+                                     accept_timeout=0.02)
+        return helper, device, messages
+
+    def test_a_repeated_duty_logs_once_and_a_change_or_a_hand_back_logs_again(self):
+        helper, device, messages = self.helper()
+        token = object()
+        for _ in range(3):
+            self.assertEqual(helper._dispatch(token, "set-duty", {"percent": 55}), {"applied": 55})
+        self.assertEqual(messages, ["set-duty 55%"])
+        self.assertEqual(device.calls, [("duty", 55)] * 3, "every write still reaches the fan")
+        helper._dispatch(token, "set-duty", {"percent": 70})
+        self.assertEqual(messages, ["set-duty 55%", "set-duty 70%"])
+        helper._dispatch(token, "auto", {})
+        helper._dispatch(token, "set-duty", {"percent": 70})
+        self.assertEqual(messages, ["set-duty 55%", "set-duty 70%", "auto", "set-duty 70%"])
+
+    def test_a_repeated_temperature_target_logs_once_and_a_change_logs_again(self):
+        helper, device, messages = self.helper()
+        token = object()
+        for _ in range(3):
+            self.assertEqual(helper._dispatch(token, "set-temp", {"celsius": 83}), {"applied": 83})
+        self.assertEqual(messages, ["set-temp 83 °C"])
+        helper._dispatch(token, "set-temp", {"celsius": 80})
+        self.assertEqual(messages, ["set-temp 83 °C", "set-temp 80 °C"])
+        self.assertEqual(device.calls, [("temp", 83)] * 3 + [("temp", 80)])
+
+
 class HelperRecheckTests(unittest.TestCase):
     """The helper starts independently of the daemon (no unit ordering)."""
 
