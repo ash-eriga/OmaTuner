@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Remove an OmaTuner system-mode installation (the inverse of bin/install):
+# service, daemon code, state, msr module config, sleep hook, the UI plugin
+# for the invoking desktop user, and optionally the service user itself.
+# --dry-run prints every planned action without touching the system.
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dry=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry=1 ;;
+    -h|--help)
+      echo "usage: sudo bin/uninstall [--dry-run]"
+      echo "  --dry-run  print every planned action without touching the system"
+      exit 0
+      ;;
+    *)
+      # Anything else is rejected before the root check and before the reset:
+      # a typo must never start a real removal.
+      echo "bin/uninstall: unknown option $arg" >&2
+      echo "usage: sudo bin/uninstall [--dry-run]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ $dry -eq 0 && $EUID -ne 0 ]]; then
+  echo "bin/uninstall must run as root (sudo bin/uninstall); use --dry-run to preview" >&2
+  exit 1
+fi
+
+run() {
+  if [[ $dry -eq 1 ]]; then echo "DRY $*"; else "$@"; fi
+}
+
+SERVICE_USER=omatuner
+INSTALL_ROOT=/usr/local
+
+# remove_service_user: deletes the account, the desktop member and the group,
+# so a later install starts from a clean slate (bin/lib-service-user.sh).
+# shellcheck source=bin/lib-service-user.sh
+. "$repo/bin/lib-service-user.sh"
+
+echo "== OmaTuner system uninstall $([[ $dry -eq 1 ]] && echo '(dry run)')"
+
+# 0. hardware back to factory values, without a reboot ---------------------
+# MSR offsets survive a written value until they are overwritten (they reset
+# on reboot/S3), and NVML offsets live until the driver unloads. Reset both
+# through the service while it still runs, so removing OmaTuner leaves the
+# machine at stock settings and undoing the tuning never needs a reboot.
+# `reset_state` is what the final line reports: 1 only when every component
+# answered.
+reset_state=0
+if [[ $dry -eq 1 ]]; then
+  echo "DRY omatuner apply --component cpu --mode reset"
+  echo "DRY omatuner apply --component gpu --mode reset"
+  reset_state=1
+elif [[ -x $INSTALL_ROOT/bin/omatuner ]]; then
+  reset_ok=1
+  if ! systemctl is-active --quiet omatuner.service; then
+    systemctl start omatuner.service 2>/dev/null || reset_ok=0
+    sleep 1
+  fi
+  if [[ $reset_ok -eq 1 ]]; then
+    reset_state=1
+    for component in cpu gpu; do
+      if "$INSTALL_ROOT/bin/omatuner" apply --component "$component" --mode reset >/dev/null 2>&1; then
+        echo "reset $component to factory values"
+      else
+        reset_state=0
+        echo "NOTE: could not reset $component; a control may be unavailable (see omatuner status)." >&2
+      fi
+    done
+  else
+    echo "NOTE: the daemon is not running, so applied offsets were not reset here." >&2
+    echo "      They clear at the next power cycle; start the service and run" >&2
+    echo "      'omatuner apply --component cpu --mode reset' to clear them now." >&2
+  fi
+else
+  echo "NOTE: the installed CLI is gone, so offsets were not reset here; they clear at the next power cycle." >&2
+fi
+
+# 1. services --------------------------------------------------------------
+# The fan helper goes first: it runs as root and hands the fan back to the
+# driver on SIGTERM, which must happen while its code still exists.
+run systemctl disable --now omatuner-fan.service 2>/dev/null || echo "NOTE: omatuner-fan.service was not running or not installed; continuing." >&2
+run systemctl disable --now omatuner.service 2>/dev/null || echo "NOTE: omatuner.service was not running or not installed; continuing." >&2
+run rm -f /etc/systemd/system/omatuner-fan.service
+run rm -f /etc/systemd/system/omatuner.service
+run systemctl daemon-reload
+run systemctl reset-failed 2>/dev/null || true
+
+# 2. daemon code and system state ------------------------------------------
+run rm -f "$INSTALL_ROOT/bin/omatuner"
+run rm -rf "$INSTALL_ROOT/lib/omatuner"
+run rm -rf /var/lib/omatuner /run/omatuner /run/omatuner-fan
+
+# 2b. tuning mode opt-in ----------------------------------------------------
+# The mode file is the only trace of `bin/install --expert`; removing it
+# returns the next install to normal mode.
+run rm -f /etc/omatuner/mode
+[[ $dry -eq 1 ]] && echo "DRY rmdir /etc/omatuner (when empty)" || rmdir /etc/omatuner 2>/dev/null || true
+
+# 3. kernel module config and hooks ----------------------------------------
+run rm -f /etc/modules-load.d/omatuner.conf
+echo "NOTE: the msr module stays loaded until the next boot (other tools may be using it); unload it now with: sudo modprobe -r msr"
+run rm -f /usr/lib/systemd/system-sleep/omatuner.sh
+# the node ownership rule and the older group-based rule
+run rm -f /etc/udev/rules.d/90-omatuner-msr.rules
+run rm -f /etc/udev/rules.d/99-omatuner-msr.rules
+run udevadm control --reload-rules 2>/dev/null || echo "NOTE: udevadm is not available; the rule is removed and applies at the next boot." >&2
+# Reloading the rules is not enough: the nodes that already exist keep the
+# owner the old rule gave them (a user that is about to be deleted). Trigger
+# the subsystem so they fall back to root:root now, not at the next boot.
+run udevadm trigger --subsystem-match=msr 2>/dev/null || true
+
+# 4. the desktop user's side (plugin, bar entry, user unit, symlink) --------
+# as-desktop replays the session environment: sudo resets it, and without
+# OMARCHY_PATH the rescan that removes the chip from the running shell would
+# silently do nothing.
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+  run "$repo/bin/as-desktop" "$SUDO_USER" "$repo/bin/uninstall-ui"
+elif [[ $dry -eq 1 ]]; then
+  echo "DRY $repo/bin/as-desktop <SUDO_USER> $repo/bin/uninstall-ui"
+else
+  echo "NOTE: no desktop user detected; run bin/uninstall-ui as that user to remove the bar plugin."
+fi
+
+# 5. service user and group -------------------------------------------------
+# Removes the user, its home (/var/lib/omatuner) and the group. The group is
+# the piece `userdel -r` leaves behind while the desktop user is a member,
+# and an orphan group is what made the next install fail.
+if [[ $dry -eq 1 ]]; then
+  echo "DRY gpasswd -d ${SUDO_USER:-<desktop user>} $SERVICE_USER"
+  echo "DRY userdel -r $SERVICE_USER; groupdel $SERVICE_USER"
+elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+  remove_service_user "$SERVICE_USER" "${SUDO_USER:-}"
+else
+  remove_service_user "$SERVICE_USER"
+fi
+
+if [[ $dry -eq 1 ]]; then
+  echo "done (dry run). Nothing was changed."
+elif [[ $reset_state -eq 1 ]]; then
+  echo "done. Applied offsets were reset to factory values first; no reboot is needed."
+else
+  echo "done. Offsets were NOT reset by this script; they clear at the next power cycle."
+fi

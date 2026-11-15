@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "ash.omatuner",
+  "name": "OmaTuner",
+  "version": "0.1.0",
+  "author": "ash",
+  "license": "MIT",
+  "description": "CPU and GPU tuning with confirm-protected application and recovery",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaTuner",
+    "description": "CPU and GPU tuning with confirm-protected application and recovery",
+    "category": "System",
+    "aliases": ["tuner", "undervolt", "overclock", "fan"],
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

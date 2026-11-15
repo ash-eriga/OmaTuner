@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Prove-it-works entrypoint: runs every verification this machine can run
+# and prints an honest report of what was exercised and what was not.
+#
+#   bin/validate          # unit tests + real-hardware reads + live plugin
+#   bin/validate --visual # additionally open the popup and screenshot it
+#                         # (requires an unlocked session)
+#
+# Exits non-zero when any check that should pass fails.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+
+logdir="$(mktemp -d)"
+trap 'rm -rf "$logdir"' EXIT
+
+pass=0
+fail=0
+section() { printf '\n== %s\n' "$1"; }
+report() {
+  if [[ "$1" == ok ]]; then pass=$((pass+1)); printf '  PASS %s\n' "$2"
+  elif [[ "$1" == skip ]]; then printf '  SKIP %s\n' "$2"
+  else fail=$((fail+1)); printf '  FAIL %s\n' "$2"; fi
+}
+
+section "daemon state machine (fake hardware)"
+PYTHONPATH=daemon python3 -m unittest discover -s tests -p 'test_core.py' >"$logdir/core.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "state machine suite ($(grep -oP 'Ran \K\d+' "$logdir/core.log") tests)"; else report fail "state machine suite"; tail -20 "$logdir/core.log"; fi
+
+section "limits, tuning modes, MSR encoding"
+PYTHONPATH=daemon python3 -m unittest tests.test_limits >"$logdir/limits.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "limits/mode suite ($(grep -oP 'Ran \K\d+' "$logdir/limits.log") tests)"; else report fail "limits/mode suite"; tail -20 "$logdir/limits.log"; fi
+
+section "curve scale migration (NVAPI units)"
+PYTHONPATH=daemon python3 -m unittest tests.test_curve_scale >"$logdir/curvescale.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "curve-scale suite ($(grep -oP 'Ran \K\d+' "$logdir/curvescale.log") tests)"; else report fail "curve-scale suite"; tail -20 "$logdir/curvescale.log"; fi
+
+section "thermal verification (trial and guard window)"
+PYTHONPATH=daemon python3 -m unittest tests.test_thermal >"$logdir/thermal.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "thermal suite ($(grep -oP 'Ran \K\d+' "$logdir/thermal.log") tests)"; else report fail "thermal suite"; tail -20 "$logdir/thermal.log"; fi
+
+section "fan policy and the root helper"
+PYTHONPATH=daemon python3 -m unittest tests.test_fan tests.test_fan_helper >"$logdir/fan.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "fan suite ($(grep -oP 'Ran \K\d+' "$logdir/fan.log") tests)"; else report fail "fan suite"; tail -20 "$logdir/fan.log"; fi
+
+section "QML scope and draft persistence"
+PYTHONPATH=daemon python3 -m unittest tests.test_qml_scope >"$logdir/qmlscope.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "QML scope suite ($(grep -oP 'Ran \K\d+' "$logdir/qmlscope.log") tests)"; else report fail "QML scope suite"; tail -20 "$logdir/qmlscope.log"; fi
+
+section "QML interaction rules"
+PYTHONPATH=daemon python3 -m unittest tests.test_qml_interaction >"$logdir/qmlinteraction.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "QML interaction suite ($(grep -oP 'Ran \K\d+' "$logdir/qmlinteraction.log") tests)"; else report fail "QML interaction suite"; tail -20 "$logdir/qmlinteraction.log"; fi
+
+section "real hardware read paths"
+PYTHONPATH=daemon python3 -m unittest tests.test_realhw >"$logdir/realhw.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "real hardware suite ($(grep -oP 'Ran \K\d+' "$logdir/realhw.log") tests)"; else report fail "real hardware suite"; tail -20 "$logdir/realhw.log"; fi
+
+section "socket access bridge (installing session, no logout)"
+PYTHONPATH=daemon python3 -m unittest tests.test_access >"$logdir/access.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "access suite ($(grep -oP 'Ran \K\d+' "$logdir/access.log") tests)"; else report fail "access suite"; tail -20 "$logdir/access.log"; fi
+
+section "daemon CLI and socket client"
+PYTHONPATH=daemon python3 -m unittest tests.test_cli tests.test_client >"$logdir/cliclient.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "CLI/client suite ($(grep -oP 'Ran \K\d+' "$logdir/cliclient.log") tests)"; else report fail "CLI/client suite"; tail -20 "$logdir/cliclient.log"; fi
+
+section "systemd unit readiness wait"
+PYTHONPATH=daemon python3 -m unittest tests.test_unit_wait >"$logdir/unitwait.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "unit-wait suite ($(grep -oP 'Ran \K\d+' "$logdir/unitwait.log") tests)"; else report fail "unit-wait suite"; tail -20 "$logdir/unitwait.log"; fi
+
+section "live hardware pickup (no daemon restart)"
+PYTHONPATH=daemon python3 -m unittest tests.test_refresh >"$logdir/refresh.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "refresh suite ($(grep -oP 'Ran \K\d+' "$logdir/refresh.log") tests)"; else report fail "refresh suite"; tail -20 "$logdir/refresh.log"; fi
+
+section "msr load path (no reboot)"
+python3 -m unittest tests.test_load_msr >"$logdir/msr.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "msr load suite ($(grep -oP 'Ran \K\d+' "$logdir/msr.log") tests)"; else report fail "msr load suite"; tail -20 "$logdir/msr.log"; fi
+
+section "service account lifecycle (install over an orphan group)"
+python3 -m unittest tests.test_service_user >"$logdir/account.log" 2>&1
+if [[ $? -eq 0 ]]; then report ok "account suite ($(grep -oP 'Ran \K\d+' "$logdir/account.log") tests)"; else report fail "account suite"; tail -20 "$logdir/account.log"; fi
+
+section "UI logic (Model.js, node)"
+if command -v node >/dev/null; then
+  if node tests/test_model.mjs >"$logdir/model.log" 2>&1; then
+    report ok "$(tail -1 "$logdir/model.log")"
+  else
+    report fail "Model.js checks"; tail -10 "$logdir/model.log"
+  fi
+else
+  report skip "node not available"
+fi
+
+section "root helper (fan and temperature writes)"
+if systemctl is-active --quiet omatuner-fan.service 2>/dev/null; then
+  report ok "omatuner-fan.service active (fan and temperature writes go through root)"
+  fan_state="$(PYTHONPATH=daemon python3 -m omatuner status --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    fan = (json.load(sys.stdin).get('state') or {}).get('fans', {}).get('gpu') or {}
+except ValueError:
+    sys.exit(1)
+print(json.dumps({k: fan.get(k) for k in ('supported', 'writable', 'speed', 'cause')}))
+" 2>/dev/null)"
+  if [[ -n "$fan_state" ]]; then
+    report ok "fan descriptor: $fan_state"
+  else
+    report skip "fan descriptor unavailable (daemon not answering)"
+  fi
+  temp_state="$(PYTHONPATH=daemon python3 -m omatuner status --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    controls = (json.load(sys.stdin).get('state') or {}).get('controls', {}).get('gpu') or []
+except ValueError:
+    sys.exit(1)
+temp = next((c for c in controls if c.get('key') == 'temp'), {})
+print(json.dumps({k: temp.get(k) for k in ('available', 'value', 'cause')}))
+" 2>/dev/null)"
+  if [[ -n "$temp_state" ]]; then
+    report ok "temperature descriptor: $temp_state"
+  else
+    report skip "temperature descriptor unavailable (daemon not answering)"
+  fi
+else
+  report fail "omatuner-fan.service is not active; fan and temperature writes stay read-only (systemctl status omatuner-fan)"
+fi
+
+section "live plugin in the running shell"
+status="$(omarchy-shell ash.omatuner status 2>/dev/null || true)"
+if [[ "$status" == *"online"* ]]; then
+  report ok "plugin registered and responsive: $status"
+  selftest="$(omarchy-shell ash.omatuner selftest 2>/dev/null || true)"
+  if [[ -n "$selftest" ]]; then
+    passed=$(printf '%s' "$selftest" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['passed'])" 2>/dev/null || echo 0)
+    failed=$(printf '%s' "$selftest" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['failed'])" 2>/dev/null || echo 1)
+    note=$(printf '%s' "$selftest" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('note','full interactive flow'))" 2>/dev/null || echo "")
+    if [[ "$failed" == "0" ]]; then report ok "live plugin selftest ($passed checks; $note)"; else report fail "live plugin selftest ($failed failing)"; fi
+  else
+    report fail "live plugin selftest did not answer"
+  fi
+else
+  report fail "plugin not reachable via shell IPC (is the shell running with the plugin installed?)"
+fi
+
+section "daemon CLI"
+if pgrep -f "python3 -m omatuner run" >/dev/null 2>&1; then
+  if PYTHONPATH=daemon python3 -m omatuner status >"$logdir/cli.log" 2>&1; then
+    report ok "omatuner status answered"; head -8 "$logdir/cli.log" | sed 's/^/    /'
+  else
+    report fail "omatuner status failed"; cat "$logdir/cli.log"
+  fi
+else
+  report skip "no daemon running (start one with bin/install-ui + systemctl --user start omatuner, or sudo bin/install)"
+fi
+
+section "privileged write paths (CPU undervolt / GPU offsets)"
+if [[ ! -e /dev/cpu/0/msr ]]; then
+  report skip "msr is not loaded: sudo modprobe msr (the running service notices the node on its own)"
+elif ! PYTHONPATH=daemon python3 - <<'EOF' 2>/dev/null
+import sys
+sys.path.insert(0, "daemon")
+from omatuner.backends.cpu_msr import CpuMsrBackend
+cpu = CpuMsrBackend({"intel": True})
+cpu.probe()
+sys.exit(0 if cpu.available else 3)
+EOF
+then
+  report skip "MSR node exists but this process cannot open it (owner $(stat -c '%U' /dev/cpu/0/msr)); the service handles it after sudo bin/install"
+else
+  report ok "MSR mailbox accessible from this process"
+fi
+
+if [[ "${1:-}" == "--visual" ]]; then
+  section "visual (screenshot)"
+  locked="$(omarchy-shell lock isLocked 2>/dev/null || echo unknown)"
+  if [[ "$locked" == "true" ]]; then
+    report skip "session is locked; unlock and re-run for the screenshot pass"
+  else
+    omarchy-shell ash.omatuner open
+    sleep 1
+    if omasnap fullscreen --save >/dev/null 2>&1; then
+      newest="$(ls -t ~/Pictures/Screenshots/*.png 2>/dev/null | head -1)"
+      if [[ -n "$newest" ]]; then report ok "screenshot saved: $newest"; else report fail "screenshot command ran but no file appeared"; fi
+    else
+      report fail "screenshot capture failed"
+    fi
+    omarchy-shell ash.omatuner close
+  fi
+else
+  section "visual (screenshot)"
+  report skip "not requested (run bin/validate --visual with the session unlocked)"
+fi
+
+printf '\n== summary: %d passed, %d failed\n' "$pass" "$fail"
+[[ $fail -eq 0 ]]

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# OmaTuner CLI against the running daemon (status, doctor, apply, ...).
+set -euo pipefail
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$repo/daemon${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m omatuner "$@"

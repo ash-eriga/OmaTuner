@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Run a command as the desktop user with that session's own environment.
+#
+# Root-run scripts (bin/install, bin/uninstall) reach the desktop through
+# runuser, but sudo resets the environment and runuser only restores HOME,
+# USER, SHELL and LOGNAME. Without OMARCHY_PATH and XDG_RUNTIME_DIR the two
+# commands that make an install take effect immediately both fail:
+#
+#   omarchy-shell shell rescanPlugins   -> "OMARCHY_PATH is not set"
+#   systemctl --user disable --now ...  -> no user bus
+#
+# The user manager still holds the session environment, so read it from
+# `systemctl --user show-environment` and replay only the variables those
+# callers need. Usage: as-desktop <user> <command> [args...]
+
+set -euo pipefail
+
+user="${1:?usage: as-desktop <user> <command> [args...]}"
+shift
+
+uid="$(id -u "$user")"
+runtime="/run/user/$uid"
+
+env_args=("XDG_RUNTIME_DIR=$runtime")
+while IFS= read -r line; do
+  case "${line%%=*}" in
+    OMARCHY_PATH|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|HYPRLAND_INSTANCE_SIGNATURE|DISPLAY)
+      env_args+=("$line")
+      ;;
+  esac
+done < <(runuser -u "$user" -- env "XDG_RUNTIME_DIR=$runtime" systemctl --user show-environment 2>/dev/null || true)
+
+# A session whose manager did not export OMARCHY_PATH still has the packaged
+# shell; omarchy-shell only needs the path to shell.qml.
+have_omarchy_path=0
+for entry in "${env_args[@]}"; do
+  if [[ $entry == OMARCHY_PATH=* ]]; then
+    have_omarchy_path=1
+  fi
+done
+if [[ $have_omarchy_path -eq 0 && -f /usr/share/omarchy/shell/shell.qml ]]; then
+  env_args+=("OMARCHY_PATH=/usr/share/omarchy")
+fi
+
+exec runuser -u "$user" -- env "${env_args[@]}" "$@"

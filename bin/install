@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# Install the OmaTuner system service. Run with sudo.
+#
+# What it sets up, and why each piece exists:
+# - a dedicated `omatuner` system user: the daemon never runs as UID 0
+#   (design requirement); it gets exactly CAP_SYS_ADMIN (NVML clock control)
+#   and CAP_SYS_RAWIO (MSR access) plus elevated nice priority
+# - the msr kernel module loaded at boot; device access stays gated by the
+#   kernel's CAP_SYS_RAWIO check, which only the daemon holds
+# - a systemd system unit with ExecStop writing the clean-shutdown marker,
+#   which is what makes a missing marker mean "abrupt restart" at next boot
+# - a systemd system-sleep hook so suspend/resume reapply is belt-and-braces
+#   on top of the daemon's own clock-based resume detection
+# - the desktop user in the omatuner group, for the control socket; the
+#   group only applies to sessions started after it was granted, so the
+#   daemon also grants a socket ACL to this installer's running session
+#   (no logout, no reboot) and the UI plugin is reloaded into the shell
+#   that is already running
+# - the UI plugin, installed for the desktop user via bin/install-ui
+#
+# This is the one canonical install path; bin/install-ui is only the
+# no-root fallback. --dry-run prints every planned action without
+# touching the system.
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dry=0
+expert=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry=1 ;;
+    --expert) expert=1 ;;
+    -h|--help)
+      echo "usage: sudo bin/install [--dry-run] [--expert]"
+      echo "  --expert  unlock the widest CPU/GPU ranges (one explicit opt-in)"
+      exit 0
+      ;;
+    *)
+      echo "bin/install: unknown option $arg" >&2
+      echo "usage: sudo bin/install [--dry-run] [--expert]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ $dry -eq 0 && $EUID -ne 0 ]]; then
+  echo "bin/install must run as root (sudo bin/install); use --dry-run to preview" >&2
+  exit 1
+fi
+
+run() {
+  if [[ $dry -eq 1 ]]; then
+    echo "DRY $*"
+  else
+    "$@"
+  fi
+}
+
+write() { # write <mode> <path> <content-from-stdin>
+  local mode="$1" path="$2"
+  if [[ $dry -eq 1 ]]; then
+    cat > /dev/null
+    echo "DRY write $mode $path"
+  else
+    cat > "$path"
+    chmod "$mode" "$path"
+    echo "wrote $path"
+  fi
+}
+
+SERVICE_USER=omatuner
+INSTALL_ROOT=/usr/local
+
+# load_msr: modprobe needs no reboot (see bin/lib-msr.sh for the diagnostics).
+# shellcheck source=bin/lib-msr.sh
+. "$repo/bin/lib-msr.sh"
+# ensure_service_user: tolerant of the orphan group a previous uninstall
+# leaves behind (see bin/lib-service-user.sh).
+# shellcheck source=bin/lib-service-user.sh
+. "$repo/bin/lib-service-user.sh"
+# wait_for_active_unit: a single is-active right after a restart reports an
+# auto-restarting unit as down (see bin/lib-unit-wait.sh).
+# shellcheck source=bin/lib-unit-wait.sh
+. "$repo/bin/lib-unit-wait.sh"
+
+echo "== OmaTuner system install$( [[ $dry -eq 1 ]] && echo ' (dry run)' )"
+echo "repo: $repo"
+
+# 1. service user ---------------------------------------------------------
+# A leftover group without its user (see bin/lib-service-user.sh) must not
+# stop the install: the account is created against the group that exists.
+ensure_service_user "$SERVICE_USER" /var/lib/omatuner
+if getent group systemd-journal >/dev/null; then
+  run usermod -aG systemd-journal "$SERVICE_USER"
+else
+  echo "NOTE: systemd-journal group missing; kernel-log diagnosis will be limited" >&2
+fi
+
+# 1b. tuning mode ---------------------------------------------------------
+# One explicit opt-in, persisted where the daemon reads it at boot. A plain
+# install writes normal mode, so re-running without --expert is a deliberate
+# downgrade that the daemon enforces again. bin/uninstall removes the file.
+if [[ $expert -eq 1 ]]; then
+  if [[ $dry -eq 1 ]]; then
+    echo "DRY write 644 /etc/omatuner/mode (expert)"
+  else
+    mkdir -p /etc/omatuner
+    printf 'expert\n' > /etc/omatuner/mode
+    chmod 644 /etc/omatuner/mode
+    echo "wrote /etc/omatuner/mode (expert)"
+  fi
+  echo "WARNING: expert mode unlocks the widest ranges (CPU -500..+200 mV, GPU up to the driver's reported limits)."
+  echo "         The 5-second automatic revert still protects against a hang, but extreme values can still damage hardware."
+else
+  if [[ $dry -eq 1 ]]; then
+    echo "DRY remove /etc/omatuner/mode (normal mode)"
+  else
+    rm -f /etc/omatuner/mode
+  fi
+fi
+
+# 2. daemon code ----------------------------------------------------------
+# The destination is removed first: a plain `cp -r src dst` copies INTO an
+# existing dst, which would nest omatuner/omatuner on a re-install.
+run rm -rf "$INSTALL_ROOT/lib/omatuner/omatuner"
+run mkdir -p "$INSTALL_ROOT/lib/omatuner" "$INSTALL_ROOT/bin"
+run cp -r "$repo/daemon/omatuner" "$INSTALL_ROOT/lib/omatuner/omatuner"
+write 755 "$INSTALL_ROOT/bin/omatuner" <<EOF
+#!/usr/bin/env bash
+# OmaTuner control CLI and daemon entrypoint.
+export PYTHONPATH="$INSTALL_ROOT/lib/omatuner\${PYTHONPATH:+:\$PYTHONPATH}"
+exec /usr/bin/python3 -m omatuner "\$@"
+EOF
+
+# 3. systemd unit ---------------------------------------------------------
+# OMATUNER_CLIENT_USERS names the desktop user running this install. That
+# session predates the new group membership, so the daemon adds one ACL
+# entry for it on the socket and runtime directory (access.py): the plugin
+# works in the session that is already open, with no logout or reboot.
+write 644 /etc/systemd/system/omatuner.service <<EOF
+[Unit]
+Description=OmaTuner hardware tuning service
+After=multi-user.target omatuner-fan.service
+# The fan and temperature-target writes go through the helper. Wants starts
+# it with the daemon, After orders the daemon behind its activation (the
+# helper still binds a moment later, which the backend re-probes).
+Wants=omatuner-fan.service
+
+[Service]
+Type=exec
+User=$SERVICE_USER
+Group=$SERVICE_USER
+SupplementaryGroups=systemd-journal
+# Not UID 0, by design: only the two capabilities hardware access needs.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO
+# The two capabilities are broad; the filesystem and the socket families are
+# not. The daemon reads /dev/cpu/*/msr, /sys hwmon and its own state; it never
+# writes outside StateDirectory/RuntimeDirectory, never touches $HOME and never
+# opens a network socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+StateDirectory=omatuner
+StateDirectoryMode=0750
+Nice=-20
+RuntimeDirectory=omatuner
+RuntimeDirectoryMode=0750
+Environment=OMATUNER_MODE=system
+Environment="OMATUNER_CLIENT_USERS=${SUDO_USER:-}"
+ExecStart=$INSTALL_ROOT/bin/omatuner run --backend real --system
+# An orderly stop writes the marker whose absence at boot means "abrupt".
+ExecStop=$INSTALL_ROOT/bin/omatuner internal mark-clean
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 3b. root helper unit -----------------------------------------------------
+# Driver 580 accepts nvmlDeviceSetFanSpeed_v2 / SetDefaultFanSpeed_v2 /
+# SetTemperatureThreshold only from uid 0: the daemon's own user is refused
+# with NVML error 4 even with CAP_SYS_ADMIN + CAP_SYS_RAWIO (measured on the
+# reference GTX 1060). This unit is the smallest surface that can still
+# write: root, the same two capabilities, one unix socket, three methods (set
+# a duty, hand the fan back, write the temperature target). SO_PEERCRED
+# limits it to the omatuner user, and it restores the driver curve when that
+# client disconnects. The rest of OmaTuner stays unprivileged.
+write 644 /etc/systemd/system/omatuner-fan.service <<EOF
+[Unit]
+Description=OmaTuner root helper (fan and temperature-target writes)
+After=multi-user.target
+# Without an NVIDIA device there is nothing to serve: enable is harmless, the
+# unit is skipped instead of starting and exiting with "nvmlInit failed".
+ConditionPathExists=/dev/nvidiactl
+
+[Service]
+Type=exec
+User=root
+# The runtime directory is setgid omatuner, so the socket it holds is
+# root:omatuner 0660 without needing CAP_CHOWN.
+Group=$SERVICE_USER
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RuntimeDirectory=omatuner-fan
+RuntimeDirectoryMode=2750
+ExecStart=$INSTALL_ROOT/bin/omatuner fan-helper --socket /run/omatuner-fan/fan.sock
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 4. msr module -----------------------------------------------------------
+# msr.ko creates the node as 0600 root:root (its own devnode mode), and the
+# driver's CAP_SYS_RAWIO check happens *after* the VFS permission check. So
+# CAP_SYS_RAWIO alone cannot open it: the node must belong to the service
+# user. Handing it to the whole `omatuner` group would give the desktop user
+# (a member, for the socket) raw MSR writes — root-equivalent — so the rule
+# changes the owner instead, keeping the mode at 0600. modules-load.d only
+# keeps the module present across boots; the load below is what makes the
+# controls work in this boot.
+write 644 /etc/modules-load.d/omatuner.conf <<'EOF'
+msr
+EOF
+write 644 /etc/udev/rules.d/90-omatuner-msr.rules <<EOF
+# OmaTuner: /dev/cpu/*/msr belongs to the service account, mode 0600.
+# The msr driver checks CAP_SYS_RAWIO when the node is opened, but the VFS
+# checks ownership first; the unit runs as $SERVICE_USER with that capability
+# and nothing else, so the node must be owned by it.
+SUBSYSTEM=="msr", KERNEL=="msr[0-9]*", OWNER="$SERVICE_USER", MODE="0600"
+EOF
+# converge installs from before this rule (group-based exposure)
+run rm -f /etc/udev/rules.d/99-omatuner-msr.rules
+if [[ $dry -eq 1 ]]; then
+  echo "DRY udevadm control --reload; modprobe msr (then wait for /dev/cpu/0/msr)"
+else
+  udevadm control --reload-rules 2>/dev/null || true
+  load_msr || echo "NOTE: CPU voltage controls stay unavailable until msr loads; see the cause above." >&2
+  # A node created before the rule was installed still belongs to root, and
+  # a rule added after the module loaded only applies on the next uevent.
+  udevadm trigger --subsystem-match=msr 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    [[ -e /dev/cpu/0/msr ]] && break
+    sleep 0.05
+  done
+  chown "$SERVICE_USER" /dev/cpu/*/msr 2>/dev/null || true
+fi
+
+# 5. sleep/resume hook ----------------------------------------------------
+write 755 /usr/lib/systemd/system-sleep/omatuner.sh <<EOF
+#!/bin/sh
+# Notify the OmaTuner daemon after resume (socket is group-writable), so it
+# reapplies the session settings if the hardware lost them. Belt-and-braces
+# next to the daemon's own clock-based resume detection.
+if [ "\$1" = "post" ]; then
+  for i in 1 2 3 4 5; do
+    [ -S /run/omatuner/omatuner.sock ] && break
+    sleep 1
+  done
+  python3 - <<'PYEOF' 2>/dev/null || true
+import json, os, socket, sys
+
+path = "/run/omatuner/omatuner.sock"
+if not os.path.exists(path):
+    sys.exit(0)
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5)
+        s.connect(path)
+        s.sendall(json.dumps({"id": 1, "method": "internal/resume", "params": {}}).encode() + b"\n")
+        s.recv(4096)
+except OSError:
+    pass
+PYEOF
+fi
+exit 0
+EOF
+
+# 6. desktop user access --------------------------------------------------
+# The group grants the socket to sessions started after this. This session
+# predates it, which is why the daemon also adds a socket ACL for it
+# (access.py): no logout, no reboot.
+desktop_user="${SUDO_USER:-}"
+if [[ "$desktop_user" == root ]]; then
+  desktop_user=""
+fi
+if [[ -n "$desktop_user" ]]; then
+  run usermod -aG "$SERVICE_USER" "$desktop_user"
+  [[ $dry -eq 0 ]] && echo "added $desktop_user to group $SERVICE_USER"
+elif [[ $dry -eq 1 ]]; then
+  echo "DRY usermod -aG $SERVICE_USER <SUDO_USER>"
+fi
+
+# 7. daemon service, started before the UI ---------------------------------
+# The chip is installed next and must find a live daemon, so the service
+# comes up first. restart, not `enable --now`: an already-running daemon
+# would keep the previous unit's environment (OMATUNER_CLIENT_USERS) after a
+# re-install, and an old process would keep the old code.
+session_ok=0
+if [[ $dry -eq 1 ]]; then
+  echo "DRY systemctl daemon-reload; enable omatuner.service omatuner-fan.service"
+  echo "DRY restart omatuner.service omatuner-fan.service"
+  echo "DRY as-desktop <SUDO_USER> python3 -c '<connect + hello on /run/omatuner/omatuner.sock>'"
+else
+  systemctl daemon-reload
+  systemctl enable omatuner.service omatuner-fan.service
+  # The root helper first: the daemon's probe asks it for a hello, and the
+  # descriptor it builds at startup is what the UI shows. A machine without an
+  # NVIDIA device has no helper to run: that must not abort the install, the
+  # daemon reports the missing writes as unavailable with the cause, and the
+  # unit's ConditionPathExists skips it.
+  if ! systemctl restart omatuner-fan.service 2>/dev/null; then
+    echo "NOTE: the root helper did not start; fan and temperature writes stay unavailable." >&2
+  elif [[ -e /dev/nvidiactl ]]; then
+    # Type=exec reports "started" as soon as the process is executed, so a
+    # helper that exits at once ("nvmlInit failed") would pass silently.
+    # Check at 1 s, then once more past RestartSec (2 s): a transient failure
+    # leaves the unit in "activating (auto-restart)", where is-active is false
+    # too. Still down after both checks is worth a warning, never an abort.
+    if ! wait_for_active_unit omatuner-fan.service 1 3; then
+      echo "WARNING: omatuner-fan.service is not running after it was started." >&2
+      echo "         Fan and temperature-target writes stay unavailable; CPU and GPU" >&2
+      echo "         clock tuning is unaffected. See: journalctl -u omatuner-fan -n 30" >&2
+    fi
+  else
+    echo "NOTE: no NVIDIA device (/dev/nvidiactl); the root helper is skipped. Fan and"
+    echo "      temperature-target writes stay unavailable, clock tuning is unaffected."
+  fi
+  if ! systemctl restart omatuner.service; then
+    echo "ERROR: failed to start omatuner.service." >&2
+    echo "       See why: journalctl -u omatuner.service -n 30 --no-pager" >&2
+    exit 1
+  fi
+
+  # Type=exec reports "started" before the daemon has bound its socket, and
+  # the interesting question is not whether the unit is up but whether this
+  # login session can use it. Probe as the desktop user, on the system
+  # socket explicitly (the CLI would fall back to a leftover user socket).
+  if [[ -n "$desktop_user" ]]; then
+    for _ in $(seq 1 30); do
+      if "$repo/bin/as-desktop" "$desktop_user" /usr/bin/python3 - <<'PYEOF' 2>/dev/null
+import socket, sys
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.settimeout(5)
+    sock.connect("/run/omatuner/omatuner.sock")
+    sock.sendall(b'{"id": 1, "method": "hello", "params": {}}\n')
+    sock.recv(4096)
+PYEOF
+      then
+        session_ok=1
+        break
+      fi
+      sleep 0.2
+    done
+  fi
+
+  echo "== service status:"
+  systemctl --no-pager --lines=5 status omatuner.service || true
+  echo "== root helper status:"
+  systemctl --no-pager --lines=3 status omatuner-fan.service || true
+  if [[ -n "$desktop_user" && $session_ok -eq 1 ]]; then
+    echo "== this session can use the service: no logout, no reboot"
+  elif [[ -n "$desktop_user" ]]; then
+    echo "NOTE: the service did not answer $desktop_user's session yet." >&2
+    echo "      Check: journalctl -u omatuner -n 30 ; omatuner status" >&2
+  fi
+fi
+
+# 8. UI plugin + user unit handover --------------------------------------
+# as-desktop replays the session environment (see that script): without it
+# install-ui's rescan and its systemctl --user calls fail silently, which is
+# what used to leave the chip waiting for a shell restart or a reboot.
+if [[ -n "$desktop_user" ]]; then
+  if [[ $dry -eq 1 ]]; then
+    echo "DRY $repo/bin/as-desktop $desktop_user env OMATUNER_SYSTEM_SERVICE=1 $repo/bin/install-ui"
+    echo "DRY $repo/bin/as-desktop $desktop_user systemctl --user disable --now omatuner.service"
+  else
+    # OMATUNER_SYSTEM_SERVICE tells install-ui the system unit owns the
+    # daemon: no user unit, and no no-root warning. It goes through `env` so
+    # it reaches install-ui even though runuser rebuilds the environment.
+    if ! "$repo/bin/as-desktop" "$desktop_user" env OMATUNER_SYSTEM_SERVICE=1 "$repo/bin/install-ui"; then
+      echo "NOTE: UI plugin install failed; run bin/install-ui as $desktop_user" >&2
+    fi
+    # the system service replaces any user-mode daemon from an earlier
+    # no-root install
+    "$repo/bin/as-desktop" "$desktop_user" systemctl --user disable --now omatuner.service 2>/dev/null || true
+  fi
+elif [[ $dry -eq 1 ]]; then
+  echo "DRY $repo/bin/as-desktop <SUDO_USER> $repo/bin/install-ui"
+else
+  echo "NOTE: no desktop user detected (SUDO_USER unset); the UI plugin was not installed."
+  echo "      Run bin/install-ui as the desktop user to get the bar chip."
+  echo "      The socket ACL bridge was skipped too: that user needs a new login for the omatuner group."
+fi
+
+# 9. what the backend can do right now -------------------------------------
+# Say what the hardware backend reaches at this instant. The controls are
+# exactly what the UI shows; nothing here waits for a reboot.
+if [[ $dry -eq 1 ]]; then
+  echo "DRY as-desktop <SUDO_USER> $INSTALL_ROOT/bin/omatuner doctor"
+elif [[ -n "$desktop_user" && $session_ok -eq 1 ]]; then
+  doctor_json="$("$repo/bin/as-desktop" "$desktop_user" "$INSTALL_ROOT/bin/omatuner" doctor 2>/dev/null || true)"
+  printf '%s' "$doctor_json" | /usr/bin/python3 -c '
+import json, sys
+
+try:
+    report = json.loads(sys.stdin.read().strip())
+except ValueError:
+    print("  doctor did not return JSON")
+    raise SystemExit(0)
+print("  msr module loaded: " + ("yes" if report.get("msrLoaded") else "no"))
+print("  tuning mode: " + str(report.get("tuningMode", "normal")))
+state = report.get("state", {})
+for component in ("cpu", "gpu"):
+    controls = state.get("controls", {}).get(component, [])
+    ready = [c["key"] for c in controls if c.get("available")]
+    blocked = [(c["key"], c.get("cause") or "unknown cause") for c in controls if not c.get("available")]
+    line = "  " + component.upper() + ": " + ("available: " + ", ".join(ready) if ready else "unavailable")
+    if blocked:
+        line += " | " + "; ".join(key + ": " + cause for key, cause in blocked)
+    print(line)
+fan = (state.get("fans", {}) or {}).get("gpu") or {}
+if fan.get("supported"):
+    access = "writable" if fan.get("writable") else "read-only"
+    cause = " (" + fan["cause"] + ")" if fan.get("cause") else ""
+    print("  gpu fan: " + str(fan.get("speed")) + "% " + access + cause)
+'
+  echo "  (omatuner doctor prints the full report, including the journal tail)"
+elif [[ $dry -eq 0 ]]; then
+  "$INSTALL_ROOT/bin/omatuner" doctor || true
+fi
+
+echo
+echo "== next steps"
+echo "1. Verify any time: omatuner status   (omatuner doctor for the hardware probe)"
+if [[ -n "$desktop_user" && $dry -eq 0 ]]; then
+  echo "2. The chip is in the bar and the shell that was already running reloaded it."
+fi
+echo "   If it is ever missing: omarchy-shell shell rescanPlugins   (no reboot needed)"
+
+echo "done."

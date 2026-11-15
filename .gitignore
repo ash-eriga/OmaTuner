@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+docs-*.png
+.visual/
+
+# Release tarballs and local snapshots are build output, not source.
+*.tar.gz
+*.tar.xz
+*.zip
+
+# Scratch files from local runs.
+*.log
+.venv/
+.pytest_cache/
+.claude/

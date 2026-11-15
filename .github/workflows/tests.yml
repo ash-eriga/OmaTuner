@@ -1,0 +1,47 @@
+name: tests
+
+# This workflow is manual only and never runs on push or pull request.
+# Run it with: gh workflow run tests.yml
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python ${{ matrix.python }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        python: ["3.11", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: PYTHONPATH=daemon python -m unittest discover -s tests -v
+
+  scripts:
+    name: shell scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n bin/install bin/install-ui bin/uninstall bin/uninstall-ui \
+                  bin/validate bin/as-desktop bin/omatuner \
+                  bin/lib-msr.sh bin/lib-service-user.sh bin/lib-unit-wait.sh
+
+  model:
+    name: Model.js
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Model checks
+        run: node tests/test_model.mjs

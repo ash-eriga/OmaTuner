@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# No-root fallback for installing the OmaTuner bar plugin; the canonical
+# path is `sudo bin/install`. Run as the desktop user.
+#
+# - copies ui/ash.omatuner into ~/.config/omarchy/plugins/omatuner-v<N>: the
+#   manifest id stays ash.omatuner while the directory is versioned, because
+#   the running shell compiles each plugin file once per URL and never
+#   recompiles within a process — a fresh directory gives fresh URLs and the
+#   old copy is removed
+# - adds the widget to the bar layout in ~/.config/omarchy/shell.json
+# - registers a user-mode daemon unit and enables it (systemctl --user
+#   enable --now): without a running daemon the chip spams socket errors
+#   and reports OFFLINE
+# - links the omatuner CLI into ~/.local/bin when that directory exists
+# - asks the running shell to rescan and *checks* that the plugin landed, so
+#   the chip appears without restarting the shell
+#
+# With OMATUNER_SYSTEM_SERVICE=1 (set by bin/install) the system unit owns
+# the daemon: no user unit is written, an old one is removed, and the
+# user-level CLI symlink is not created.
+
+set -euo pipefail
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+plugins_dir="$HOME/.config/omarchy/plugins"
+plugin_id="ash.omatuner"
+system_service="${OMATUNER_SYSTEM_SERVICE:-0}"
+
+if [[ "$system_service" != 1 ]]; then
+  echo "No root: the 'omatuner' command is not on your PATH (use bin/omatuner inside this package) and privileged controls stay unavailable with their causes (msr not loaded; NVIDIA driver refusing writes without privilege); 'sudo bin/install' enables them."
+fi
+
+mkdir -p "$plugins_dir"
+
+generation=0
+for entry in "$plugins_dir"/omatuner-v*; do
+  [[ -e "$entry" ]] || continue
+  n="${entry##*omatuner-v}"
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > generation )) && generation=$n
+done
+next=$((generation + 1))
+target="$plugins_dir/omatuner-v$next"
+
+cp -r "$repo/ui/ash.omatuner" "$target"
+rm -rf "$plugins_dir"/omatuner "$plugins_dir"/omatuner-dev*
+for entry in "$plugins_dir"/omatuner-v*; do
+  [[ "$entry" == "$target" ]] && continue
+  rm -rf "$entry"
+done
+
+python3 - "$repo" <<EOF
+import json
+import os
+import sys
+
+path = os.path.expanduser("~/.config/omarchy/shell.json")
+if not os.path.exists(path):
+    print("NOTE: the plugin was installed but not added to the bar because ~/.config/omarchy/shell.json does not exist", file=sys.stderr)
+    raise SystemExit(0)
+with open(path) as fh:
+    config = json.load(fh)
+
+layout = config.setdefault("bar", {}).setdefault("layout", {})
+for section in ("left", "centerBegin", "center", "centerEnd", "right", "tray"):
+    entries = layout.setdefault(section, [])
+    cleaned = [
+        {"id": "$plugin_id"} if isinstance(w, dict) and str(w.get("id", "")).startswith(("$plugin_id", "ash.omatuner-dev"))
+        else w
+        for w in entries
+    ]
+    # one entry only: replace any tuner entry with the canonical id in place
+    replaced = False
+    final = []
+    for w in cleaned:
+        if isinstance(w, dict) and w.get("id") == "$plugin_id":
+            if replaced:
+                continue
+            replaced = True
+        final.append(w)
+    layout[section] = final
+
+right = layout.setdefault("right", [])
+if not any(isinstance(w, dict) and w.get("id") == "$plugin_id" for w in right):
+    power = next(
+        (i for i, w in enumerate(right) if isinstance(w, dict) and w.get("id") == "omarchy.power"),
+        len(right),
+    )
+    right.insert(power, {"id": "$plugin_id"})
+
+# A previous "omarchy plugin disable" must not survive a reinstall: the bar
+# entry is what enables the widget, and isEnabled() refuses a disabled id.
+disabled = config.get("disabledPlugins")
+if isinstance(disabled, list):
+    config["disabledPlugins"] = [entry for entry in disabled if entry != "$plugin_id"]
+    if not config["disabledPlugins"]:
+        del config["disabledPlugins"]
+
+with open(path + ".tmp", "w") as fh:
+    json.dump(config, fh, indent=2)
+    fh.write("\n")
+os.replace(path + ".tmp", path)
+print("bar entry: $plugin_id (right section)")
+EOF
+
+if [[ "$system_service" == 1 ]]; then
+  # The system unit is the only daemon. Remove the user unit a previous
+  # no-root install may have left, so nothing races the service and nothing
+  # points at a package directory later deleted.
+  if [[ -e "$HOME/.config/systemd/user/omatuner.service" ]]; then
+    systemctl --user disable --now omatuner.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/omatuner.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    echo "removed the user-mode daemon unit (the system service replaces it)"
+  fi
+  # A socket file left without its daemon makes the plugin waste a reconnect
+  # attempt on it before reaching the system socket; remove it so the first
+  # connection goes straight to the service.
+  rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omatuner.sock"
+  # Likewise the CLI: /usr/local/bin/omatuner is the installed one. Remove a
+  # symlink into this package if an earlier no-root install created it.
+  if [[ -L "$HOME/.local/bin/omatuner" && "$(readlink -f "$HOME/.local/bin/omatuner")" == "$repo/bin/omatuner" ]]; then
+    rm -f "$HOME/.local/bin/omatuner"
+    echo "removed $HOME/.local/bin/omatuner (the installed CLI is /usr/local/bin/omatuner)"
+  fi
+else
+  mkdir -p "$HOME/.config/systemd/user"
+  cat > "$HOME/.config/systemd/user/omatuner.service" <<EOF
+[Unit]
+Description=OmaTuner tuning daemon (user mode)
+
+[Service]
+Type=exec
+WorkingDirectory=$repo/daemon
+Environment=OMATUNER_MODE=user
+ExecStart=/usr/bin/python3 -m omatuner run --backend real
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+
+  if [[ -d "$HOME/.local/bin" ]]; then
+    ln -sfn "$repo/bin/omatuner" "$HOME/.local/bin/omatuner"
+    echo "linked $HOME/.local/bin/omatuner -> $repo/bin/omatuner"
+  else
+    echo "NOTE: $HOME/.local/bin does not exist; no omatuner symlink. Use bin/omatuner inside the package." >&2
+  fi
+
+  # A headless context has no user bus; the failure must not abort the install,
+  # but the chip stays OFFLINE until the daemon is enabled in a real session.
+  # restart, not `enable --now`: an already-running daemon would keep the
+  # previous code after a re-install. Restart is instant and needs no reboot.
+  if systemctl --user daemon-reload \
+    && systemctl --user enable omatuner.service \
+    && systemctl --user restart omatuner.service; then
+    echo "user daemon enabled and restarted (systemctl --user enable + restart omatuner.service)"
+  else
+    echo "NOTE: systemctl --user failed here (no running user session?); the chip stays OFFLINE until you run, in a logged-in session:" >&2
+    echo "      systemctl --user enable --now omatuner.service" >&2
+  fi
+fi
+
+if [[ "$system_service" == 1 ]]; then
+  echo "plugin installed; the system service supplies the daemon"
+else
+  echo "plugin installed"
+fi
+
+# Registering the plugin is the step that used to need "omarchy restart
+# shell": reloadPlugins unloads panels and widgets, clears the component
+# cache and rescans, so the chip appears in the shell that is already
+# running. Ask, then verify — a rescan that silently did nothing is the bug
+# this check exists to catch.
+shell_ready=0
+if command -v omarchy-shell >/dev/null 2>&1; then
+  for _ in $(seq 1 10); do
+    omarchy-shell -q shell rescanPlugins || true
+    if omarchy-shell shell listPlugins 2>/dev/null | python3 -c "
+import json, sys
+plugins = json.load(sys.stdin)
+sys.exit(0 if any(p.get('id') == '$plugin_id' and p.get('enabled') for p in plugins) else 1)
+" 2>/dev/null; then
+      shell_ready=1
+      break
+    fi
+    sleep 0.3
+  done
+fi
+if [[ $shell_ready -eq 1 ]]; then
+  echo "the running shell registered $plugin_id (no shell restart, no reboot)"
+  # Registration is not the end of the chain: the chip also needs a live
+  # daemon connection. Say what really happened instead of leaving a red
+  # chip to be interpreted as a broken install.
+  online=0
+  for _ in $(seq 1 12); do
+    case "$(omarchy-shell ash.omatuner status 2>/dev/null)" in
+      *'"online":true'*) online=1; break ;;
+    esac
+    sleep 0.5
+  done
+  if [[ $online -eq 1 ]]; then
+    echo "the chip is online (daemon connection established)"
+  else
+    echo "NOTE: the chip is in the bar but reports OFFLINE." >&2
+    if [[ "$system_service" == 1 ]]; then
+      echo "      Check the daemon: systemctl status omatuner.service" >&2
+    else
+      echo "      Check the daemon: systemctl --user status omatuner.service" >&2
+    fi
+  fi
+else
+  echo "NOTE: could not confirm the plugin in a running shell." >&2
+  echo "      In your desktop session run: omarchy-shell shell rescanPlugins   (no reboot needed)" >&2
+fi

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Remove the OmaTuner user-mode installation (the inverse of bin/install-ui):
+# the user daemon unit, the shell plugin, its bar entry, and this user's
+# OmaTuner state. System-mode pieces (if `sudo bin/install` was used) need
+# root; this script prints the exact commands for those instead of failing.
+
+set -euo pipefail
+
+echo "== OmaTuner user-mode uninstall"
+
+systemctl --user disable --now omatuner.service 2>/dev/null || true
+rm -f "$HOME/.config/systemd/user/omatuner.service"
+systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user reset-failed 2>/dev/null || true
+echo "daemon unit removed"
+
+rm -rf "$HOME"/.config/omarchy/plugins/omatuner "$HOME"/.config/omarchy/plugins/omatuner-v* \
+  "$HOME"/.config/omarchy/plugins/omatuner-dev*
+echo "plugin removed"
+
+python3 - <<'EOF'
+import json
+import os
+
+path = os.path.expanduser("~/.config/omarchy/shell.json")
+if not os.path.exists(path):
+    raise SystemExit(0)
+with open(path) as fh:
+    config = json.load(fh)
+layout = config.get("bar", {}).get("layout", {})
+removed = False
+for section in ("left", "centerBegin", "center", "centerEnd", "right", "tray"):
+    entries = layout.get(section)
+    if not isinstance(entries, list):
+        continue
+    kept = [w for w in entries if not (isinstance(w, dict) and str(w.get("id", "")).startswith("ash.omatuner"))]
+    if len(kept) != len(entries):
+        removed = True
+        layout[section] = kept
+if removed:
+    with open(path + ".tmp", "w") as fh:
+        json.dump(config, fh, indent=2)
+        fh.write("\n")
+    os.replace(path + ".tmp", path)
+    print("bar entry removed")
+else:
+    print("no bar entry found")
+EOF
+
+# bin/install-ui links the CLI into ~/.local/bin; remove that link, but only
+# when it points into an OmaTuner checkout. A regular file there belongs to
+# someone else and is left alone.
+cli_link="$HOME/.local/bin/omatuner"
+if [[ -L "$cli_link" ]]; then
+  cli_target="$(readlink -f "$cli_link" 2>/dev/null || true)"
+  cli_dir="$(dirname "$cli_target")"
+  if [[ -n "$cli_target" && "$(basename "$cli_target")" == omatuner \
+    && "$(basename "$cli_dir")" == bin && -e "$cli_dir/install-ui" ]]; then
+    rm -f "$cli_link"
+    echo "removed $cli_link (it pointed into an OmaTuner checkout)"
+  fi
+fi
+
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/omatuner"
+rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omatuner.sock"
+echo "state and socket removed"
+
+# Same verification as install-ui, in reverse: a rescan that silently does
+# nothing is what makes people think a shell restart (or a reboot) is needed.
+shell_ready=0
+if command -v omarchy-shell >/dev/null 2>&1; then
+  for _ in $(seq 1 10); do
+    omarchy-shell -q shell rescanPlugins || true
+    if omarchy-shell shell listPlugins 2>/dev/null | python3 -c "
+import json, sys
+plugins = json.load(sys.stdin)
+sys.exit(1 if any(p.get('id') == 'ash.omatuner' for p in plugins) else 0)
+" 2>/dev/null; then
+      shell_ready=1
+      break
+    fi
+    sleep 0.3
+  done
+fi
+if [[ $shell_ready -eq 1 ]]; then
+  echo "the running shell unregistered the plugin (no shell restart, no reboot)"
+else
+  echo "NOTE: could not confirm removal in a running shell." >&2
+  echo "      In your desktop session run: omarchy-shell shell rescanPlugins   (no reboot needed)" >&2
+fi
+
+if [ -e /etc/systemd/system/omatuner.service ] || [ -e /etc/systemd/system/omatuner-fan.service ] \
+  || [ -e /usr/local/bin/omatuner ]; then
+  echo
+  echo "System-mode install detected. Prefer the one-command removal:"
+  echo "  sudo bin/uninstall"
+  echo "Or by hand with root (the same list, in the same order, bin/uninstall removes):"
+  echo "  sudo systemctl disable --now omatuner-fan.service omatuner.service"
+  echo "  sudo rm -f /etc/systemd/system/omatuner-fan.service /etc/systemd/system/omatuner.service"
+  echo "  sudo systemctl daemon-reload && sudo systemctl reset-failed"
+  echo "  sudo rm -f /usr/local/bin/omatuner"
+  echo "  sudo rm -rf /usr/local/lib/omatuner /var/lib/omatuner /run/omatuner /run/omatuner-fan"
+  echo "  sudo rm -f /etc/omatuner/mode && sudo rmdir /etc/omatuner"
+  echo "  sudo rm -f /etc/modules-load.d/omatuner.conf /usr/lib/systemd/system-sleep/omatuner.sh"
+  echo "  sudo rm -f /etc/udev/rules.d/90-omatuner-msr.rules /etc/udev/rules.d/99-omatuner-msr.rules"
+  echo "  sudo udevadm control --reload-rules"
+  # The event nodes keep the owner the removed rule gave them until the
+  # subsystem is triggered; without this the msr device stays owned by a
+  # user that is about to be deleted.
+  echo "  sudo udevadm trigger --subsystem-match=msr"
+  # The desktop member first: the group cannot go while it is a member, and
+  # an orphan group is what made the next install fail.
+  echo "  sudo gpasswd -d ${USER:-$(id -un)} omatuner"
+  echo "  sudo userdel -r omatuner; sudo groupdel omatuner"
+fi
